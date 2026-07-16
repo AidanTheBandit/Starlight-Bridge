@@ -11,10 +11,10 @@ export interface JsonRpcRequest {
 
 export interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id?: number;
+  id?: number | string;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
-  method?: string; // for notifications
+  method?: string;
   params?: unknown;
 }
 
@@ -22,7 +22,7 @@ export interface JsonRpcResponse {
 
 export class ACPClientWrapper {
   private nextId = 1;
-  private pending = new Map<number, {
+  private pending = new Map<number | string, {
     resolve: (v: unknown) => void;
     reject: (e: Error) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -30,6 +30,8 @@ export class ACPClientWrapper {
   private buffer = "";
   private notificationHandlers = new Map<string, Set<(params: unknown) => void>>();
   private dead = false;
+  private initialized = false;
+  private initPromise: Promise<void> | null = null;
 
   constructor(
     private proc: ChildProcess,
@@ -40,11 +42,14 @@ export class ACPClientWrapper {
       this.processBuffer();
     });
     this.proc.stderr?.on("data", (chunk: Buffer) => {
-      console.error(`[ACP ${label}]`, chunk.toString().trim());
+      const text = chunk.toString().trim();
+      if (text) console.error(`[ACP ${label}]`, text);
     });
 
-    // Reject all pending RPCs on process death
-    this.proc.on("exit", () => this.failAll("process exited"));
+    this.proc.on("exit", (code) => {
+      console.log(`[ACP ${label}] process exited (code ${code})`);
+      this.failAll("process exited");
+    });
     this.proc.on("error", (err) => this.failAll(`process error: ${err.message}`));
   }
 
@@ -57,6 +62,13 @@ export class ACPClientWrapper {
     }
   }
 
+  private write(obj: unknown): void {
+    if (!this.proc.stdin || this.proc.stdin.destroyed) {
+      throw new Error(`ACP ${this.label}: stdin unavailable`);
+    }
+    this.proc.stdin.write(JSON.stringify(obj) + "\n");
+  }
+
   private processBuffer(): void {
     const lines = this.buffer.split("\n");
     this.buffer = lines.pop() ?? "";
@@ -64,8 +76,23 @@ export class ACPClientWrapper {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line) as JsonRpcResponse;
-        if (msg.id !== undefined && msg.id !== null) {
-          // Response to a request
+
+        if (msg.method) {
+          // Agent → client message
+          if (msg.id !== undefined && msg.id !== null) {
+            // Request from agent — must respond
+            void this.handleAgentRequest(msg.method, msg.params, msg.id);
+          } else {
+            // Notification
+            const handlers = this.notificationHandlers.get(msg.method);
+            if (handlers) {
+              for (const handler of handlers) {
+                handler(msg.params);
+              }
+            }
+          }
+        } else if (msg.id !== undefined && msg.id !== null) {
+          // Response to our request
           const entry = this.pending.get(msg.id);
           if (entry) {
             clearTimeout(entry.timer);
@@ -76,18 +103,54 @@ export class ACPClientWrapper {
               entry.resolve(msg.result);
             }
           }
-        } else if (msg.method) {
-          // Notification (no id)
-          const handlers = this.notificationHandlers.get(msg.method);
-          if (handlers) {
-            for (const handler of handlers) {
-              handler(msg.params);
-            }
-          }
         }
       } catch {
         // malformed line — skip
       }
+    }
+  }
+
+  /**
+   * Handle requests from the ACP agent (permission prompts, fs access, etc.).
+   * Auto-approve permissions so headless operation works.
+   */
+  private async handleAgentRequest(
+    method: string,
+    params: unknown,
+    id: number | string,
+  ): Promise<void> {
+    try {
+      let result: unknown = {};
+
+      if (method === "session/request_permission") {
+        // Auto-allow all permissions for headless bridge use
+        const p = params as { options?: Array<{ optionId?: string; id?: string }> };
+        const options = p?.options ?? [];
+        const allow =
+          options.find((o) => /allow/i.test(o.optionId ?? o.id ?? "")) ??
+          options[0];
+        if (allow) {
+          result = {
+            outcome: {
+              outcome: "selected",
+              optionId: allow.optionId ?? allow.id,
+            },
+          };
+        }
+      } else if (method === "fs/read_text_file" || method === "fs/write_text_file") {
+        result = { content: "" };
+      } else {
+        console.error(`[ACP ${this.label}] unhandled agent request: ${method}`);
+        result = {};
+      }
+
+      this.write({ jsonrpc: "2.0", id, result });
+    } catch (err) {
+      this.write({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: (err as Error).message },
+      });
     }
   }
 
@@ -113,9 +176,6 @@ export class ACPClientWrapper {
     if (this.dead) {
       throw new Error(`ACP ${this.label}: process is dead`);
     }
-    if (!this.proc.stdin || this.proc.stdin.destroyed) {
-      throw new Error(`ACP ${this.label}: stdin unavailable`);
-    }
 
     const id = this.nextId++;
     const req: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
@@ -135,17 +195,42 @@ export class ACPClientWrapper {
       });
 
       try {
-        const ok = this.proc.stdin!.write(JSON.stringify(req) + "\n");
-        if (!ok) {
-          // Backpressure — wait for drain, but don't block the promise
-          this.proc.stdin!.once("drain", () => {});
-        }
+        this.write(req);
       } catch (err) {
         clearTimeout(timer);
         this.pending.delete(id);
-        reject(new Error(`ACP ${this.label}: write failed: ${(err as Error).message}`));
+        reject(err as Error);
       }
     });
+  }
+
+  /**
+   * Perform ACP initialize handshake (required before any session methods).
+   */
+  async ensureInitialized(): Promise<void> {
+    if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      console.log(`[ACP ${this.label}] initializing...`);
+      await this.rpc("initialize", {
+        protocolVersion: 1,
+        clientInfo: {
+          name: "starlight-bridge",
+          version: "0.1.0",
+        },
+        clientCapabilities: {},
+      }, 30_000);
+      this.initialized = true;
+      console.log(`[ACP ${this.label}] initialized`);
+    })();
+
+    try {
+      await this.initPromise;
+    } catch (err) {
+      this.initPromise = null;
+      throw err;
+    }
   }
 
   get isAlive(): boolean {

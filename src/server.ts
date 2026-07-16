@@ -2,7 +2,9 @@ import { Hono } from "hono";
 import type { Config } from "./config.js";
 import { handleChatCompletions } from "./openai/handler.js";
 import { getStatus } from "./acp/manager.js";
-import type { OpenAIModelList } from "./openai/types.js";
+import { setTools, clearTools, getToolNames } from "./mcp/store.js";
+import { handleMcpRequest } from "./mcp/server.js";
+import type { OpenAIModelList, OpenAITool } from "./openai/types.js";
 
 /**
  * Create the Hono app with all routes.
@@ -16,13 +18,13 @@ export function createApp(config: Config): Hono {
     return c.json({
       status: "ok",
       acp_clients: acpStatus,
+      mcp_tools: getToolNames(),
       uptime_seconds: Math.floor(process.uptime()),
     });
   });
 
   // ── Models ────────────────────────────────────────────────────────
   app.get("/v1/models", (c) => {
-    // Auth is optional for models list (some clients probe without auth)
     const models = config.acp_clients.map((client) => ({
       id: `${client.model_prefix}-default`,
       object: "model" as const,
@@ -39,6 +41,15 @@ export function createApp(config: Config): Hono {
 
   // ── Chat Completions ──────────────────────────────────────────────
   app.post("/v1/chat/completions", (c) => handleChatCompletions(c, config));
+
+  // ── MCP endpoint ──────────────────────────────────────────────────
+  // The bridge hosts its own MCP server here. Tools are dynamically set
+  // per-request by the OpenAI handler before the ACP session starts.
+  app.all("/mcp", async (c) => {
+    const req = c.req.raw;
+    const response = await handleMcpRequest(req, config);
+    return response;
+  });
 
   // ── Catch-all ─────────────────────────────────────────────────────
   app.all("*", (c) => {

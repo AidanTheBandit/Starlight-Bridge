@@ -2,7 +2,8 @@ import type { ACPClientWrapper } from "./client.js";
 
 /**
  * An ACP session — a conversation context within an ACP agent process.
- * Handles prompt sending, model selection, and MCP server registration.
+ *
+ * ACP uses camelCase wire format (sessionId, modelId, mcpServers, etc.).
  */
 export class ACPSession {
   private disposed = false;
@@ -29,21 +30,25 @@ export class ACPSession {
       throw new Error("Session has been disposed");
     }
 
-    // Collect streamed text from session/update notifications
     let streamedText = "";
     const chunkPromises: Promise<void>[] = [];
 
     const handler = (params: unknown) => {
       const p = params as {
-        session_id?: string;
+        sessionId?: string;
         update?: {
-          type?: string;
-          content?: Array<{ type?: string; text?: string }>;
+          sessionUpdate?: string;
+          content?: { type?: string; text?: string } | Array<{ type?: string; text?: string }>;
         };
       };
-      if (p.session_id !== this.sessionId) return;
-      if (p.update?.type === "agent_message_chunk" || p.update?.type === "agent_message") {
-        for (const block of p.update.content ?? []) {
+
+      if (p.sessionId && p.sessionId !== this.sessionId) return;
+
+      const updateType = p.update?.sessionUpdate;
+      if (updateType === "agent_message_chunk" || updateType === "agent_message") {
+        const content = p.update?.content;
+        const blocks = Array.isArray(content) ? content : content ? [content] : [];
+        for (const block of blocks) {
           if (block.type === "text" && block.text) {
             streamedText += block.text;
             if (onChunk) {
@@ -61,31 +66,17 @@ export class ACPSession {
 
     try {
       const result = await this.client.rpc<{
-        response?: string | Array<{ type: string; text?: string }>;
-        stop_reason?: string;
+        stopReason?: string;
       }>("session/prompt", {
-        session_id: this.sessionId,
+        sessionId: this.sessionId,
         prompt: [{ type: "text", text }],
-      });
+      }, 300_000);
 
       // Await any pending async onChunk callbacks
       if (chunkPromises.length > 0) {
         await Promise.all(chunkPromises);
       }
 
-      // Prefer the final response field if present
-      if (result.response) {
-        if (typeof result.response === "string") {
-          return result.response;
-        }
-        // Array of content blocks
-        return result.response
-          .filter((b) => b.type === "text" && b.text)
-          .map((b) => b.text)
-          .join("");
-      }
-
-      // Fall back to whatever was streamed
       return streamedText;
     } finally {
       unsubscribe();
@@ -93,39 +84,28 @@ export class ACPSession {
   }
 
   /**
-   * Set the model for this session.
+   * Set the model for this session (session/set_model).
    */
   async setModel(model: string): Promise<void> {
-    await this.client.rpc("session/model", {
-      session_id: this.sessionId,
-      model,
+    await this.client.rpc("session/set_model", {
+      sessionId: this.sessionId,
+      modelId: model,
     });
   }
 
   /**
-   * Register MCP servers for this session (dynamic tool injection).
-   */
-  async setMcpServers(servers: unknown[]): Promise<void> {
-    await this.client.rpc("session/mcpServers", {
-      session_id: this.sessionId,
-      mcp_servers: servers,
-    });
-  }
-
-  /**
-   * Dispose of this session, freeing resources on the ACP agent.
+   * Dispose of this session via session/close.
    */
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     try {
-      await this.client.rpc("session/dispose", {
-        session_id: this.sessionId,
+      await this.client.rpc("session/close", {
+        sessionId: this.sessionId,
       });
     } catch {
-      // Session may already be gone — ignore
+      // Session may already be gone or method unsupported — ignore
     }
-    // Notify manager to remove from registry
     this.onDispose?.();
   }
 
