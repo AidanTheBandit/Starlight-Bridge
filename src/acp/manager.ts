@@ -9,7 +9,6 @@ interface ManagedProcess {
   client: ACPClient;
   sessions: Map<string, ACPSession>;
   lastUsed: number;
-  /** Number of in-flight RPCs/prompts. cleanupIdle skips busy processes. */
   busyCount: number;
 }
 
@@ -17,7 +16,6 @@ const processes = new Map<string, ManagedProcess>();
 
 /**
  * Get or create an ACP client process for the given config.
- * Processes are reused across requests (keyed by model_prefix).
  */
 export function getOrCreateClient(client: ACPClient): ACPClientWrapper {
   const existing = processes.get(client.model_prefix);
@@ -26,7 +24,6 @@ export function getOrCreateClient(client: ACPClient): ACPClientWrapper {
     return existing.wrapper;
   }
 
-  // Clean up dead process
   if (existing) {
     processes.delete(client.model_prefix);
   }
@@ -51,8 +48,7 @@ export function getOrCreateClient(client: ACPClient): ACPClientWrapper {
 
   processes.set(client.model_prefix, managed);
 
-  // Only remove if this is still the current process (avoid stale exit killing a replacement)
-  proc.on("exit", (code) => {
+  proc.on("exit", (code: number | null) => {
     console.log(`[starlight] ACP client "${client.model_prefix}" exited (code ${code})`);
     const current = processes.get(client.model_prefix);
     if (current && current.process === proc) {
@@ -60,7 +56,7 @@ export function getOrCreateClient(client: ACPClient): ACPClientWrapper {
     }
   });
 
-  proc.on("error", (err) => {
+  proc.on("error", (err: Error) => {
     console.error(`[starlight] ACP client "${client.model_prefix}" error:`, err.message);
     const current = processes.get(client.model_prefix);
     if (current && current.process === proc) {
@@ -72,7 +68,36 @@ export function getOrCreateClient(client: ACPClient): ACPClientWrapper {
 }
 
 /**
- * Create a new ACP session, optionally with MCP servers for tool injection.
+ * Normalize MCP servers into ACP camelCase wire format.
+ */
+function toAcpMcpServers(mcpServers?: unknown[]): unknown[] {
+  if (!mcpServers || mcpServers.length === 0) return [];
+
+  return mcpServers.map((raw) => {
+    const s = raw as Record<string, unknown>;
+    if (s.command) {
+      return {
+        name: s.name,
+        command: s.command,
+        args: s.args ?? [],
+        env: s.env ?? [],
+      };
+    }
+    if (s.url) {
+      const entry: Record<string, unknown> = {
+        name: s.name,
+        url: s.url,
+        headers: s.headers ?? [],
+      };
+      if (s.type) entry.type = s.type;
+      return entry;
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+/**
+ * Create a new ACP session, optionally with MCP servers.
  */
 export async function createSession(
   client: ACPClient,
@@ -82,19 +107,24 @@ export async function createSession(
   const wrapper = getOrCreateClient(client);
   const managed = processes.get(client.model_prefix)!;
 
-  const params: Record<string, unknown> = { cwd };
-  if (mcpServers && mcpServers.length > 0) {
-    params.mcp_servers = mcpServers;
-  }
+  await wrapper.ensureInitialized();
+
+  const params = {
+    cwd,
+    mcpServers: toAcpMcpServers(mcpServers),
+  };
 
   managed.busyCount++;
   try {
-    const result = await wrapper.rpc<{ session_id: string }>("session/new", params);
-    const session = new ACPSession(result.session_id, wrapper, () => {
-      // Dispose callback: remove from manager registry
-      managed.sessions.delete(result.session_id);
+    const result = await wrapper.rpc<{ sessionId?: string }>("session/new", params);
+    const sessionId = result.sessionId;
+    if (!sessionId) {
+      throw new Error("session/new returned no sessionId");
+    }
+    const session = new ACPSession(sessionId, wrapper, () => {
+      managed.sessions.delete(sessionId);
     });
-    managed.sessions.set(result.session_id, session);
+    managed.sessions.set(sessionId, session);
     managed.lastUsed = Date.now();
     return session;
   } finally {
@@ -121,10 +151,15 @@ export async function loadSession(
 
   const wrapper = getOrCreateClient(client);
   const m = processes.get(client.model_prefix)!;
+  await wrapper.ensureInitialized();
 
   m.busyCount++;
   try {
-    await wrapper.rpc("session/load", { session_id: sessionId, cwd });
+    await wrapper.rpc("session/load", {
+      sessionId,
+      cwd,
+      mcpServers: [],
+    });
     const session = new ACPSession(sessionId, wrapper, () => {
       m.sessions.delete(sessionId);
     });
@@ -138,10 +173,6 @@ export async function loadSession(
   }
 }
 
-/**
- * Mark a managed process as busy (in-flight work).
- * Call markIdle when done.
- */
 export function markBusy(prefix: string): void {
   const m = processes.get(prefix);
   if (m) m.busyCount++;
@@ -152,9 +183,6 @@ export function markIdle(prefix: string): void {
   if (m) m.busyCount = Math.max(0, m.busyCount - 1);
 }
 
-/**
- * Close all ACP processes. Call on shutdown.
- */
 export function closeAll(): void {
   for (const [prefix, managed] of processes) {
     console.log(`[starlight] Shutting down ACP client: ${prefix}`);
@@ -163,9 +191,6 @@ export function closeAll(): void {
   processes.clear();
 }
 
-/**
- * Get status of all managed processes.
- */
 export function getStatus(): Array<{ prefix: string; alive: boolean; sessions: number; busy: boolean }> {
   return Array.from(processes.entries()).map(([prefix, m]) => ({
     prefix,
@@ -175,14 +200,10 @@ export function getStatus(): Array<{ prefix: string; alive: boolean; sessions: n
   }));
 }
 
-/**
- * Clean up idle sessions and processes.
- * Skips processes with in-flight work (busyCount > 0).
- */
 export function cleanupIdle(idleTimeoutMs: number): void {
   const now = Date.now();
   for (const [prefix, managed] of processes) {
-    if (managed.busyCount > 0) continue; // don't kill busy processes
+    if (managed.busyCount > 0) continue;
     if (now - managed.lastUsed > idleTimeoutMs) {
       console.log(`[starlight] Cleaning up idle ACP client: ${prefix}`);
       managed.wrapper.kill();
