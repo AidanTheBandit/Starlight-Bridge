@@ -3,12 +3,10 @@ import type { Config, ACPClient } from "./config.js";
 /**
  * Resolve which ACP client should handle a given model.
  * Uses longest-prefix match: "hermes-glm-5.2" → prefix "hermes".
+ * Assumes config.acp_clients is pre-sorted by longest prefix (done in config loader).
  */
 export function resolveACPClient(config: Config, model: string): ACPClient | null {
-  const sorted = [...config.acp_clients].sort(
-    (a: ACPClient, b: ACPClient) => b.model_prefix.length - a.model_prefix.length
-  );
-  for (const client of sorted) {
+  for (const client of config.acp_clients) {
     if (model.startsWith(client.model_prefix)) {
       return client;
     }

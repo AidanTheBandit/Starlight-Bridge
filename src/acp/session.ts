@@ -6,19 +6,24 @@ import type { ACPClientWrapper } from "./client.js";
  */
 export class ACPSession {
   private disposed = false;
+  private onDispose?: () => void;
 
   constructor(
     public readonly sessionId: string,
     private client: ACPClientWrapper,
-  ) {}
+    onDispose?: () => void,
+  ) {
+    this.onDispose = onDispose;
+  }
 
   /**
    * Send a prompt and wait for the full response.
    * If onChunk is provided, intermediate text chunks are streamed via callback.
+   * Async onChunk callbacks are awaited before prompt() returns.
    */
   async prompt(
     text: string,
-    onChunk?: (chunk: string) => void,
+    onChunk?: (chunk: string) => void | Promise<void>,
   ): Promise<string> {
     if (this.disposed) {
       throw new Error("Session has been disposed");
@@ -26,6 +31,8 @@ export class ACPSession {
 
     // Collect streamed text from session/update notifications
     let streamedText = "";
+    const chunkPromises: Promise<void>[] = [];
+
     const handler = (params: unknown) => {
       const p = params as {
         session_id?: string;
@@ -39,13 +46,18 @@ export class ACPSession {
         for (const block of p.update.content ?? []) {
           if (block.type === "text" && block.text) {
             streamedText += block.text;
-            onChunk?.(block.text);
+            if (onChunk) {
+              const result = onChunk(block.text);
+              if (result instanceof Promise) {
+                chunkPromises.push(result);
+              }
+            }
           }
         }
       }
     };
 
-    this.client.onNotification("session/update", handler);
+    const unsubscribe = this.client.onNotification("session/update", handler);
 
     try {
       const result = await this.client.rpc<{
@@ -55,6 +67,11 @@ export class ACPSession {
         session_id: this.sessionId,
         prompt: [{ type: "text", text }],
       });
+
+      // Await any pending async onChunk callbacks
+      if (chunkPromises.length > 0) {
+        await Promise.all(chunkPromises);
+      }
 
       // Prefer the final response field if present
       if (result.response) {
@@ -71,8 +88,7 @@ export class ACPSession {
       // Fall back to whatever was streamed
       return streamedText;
     } finally {
-      // Note: we can't easily remove the notification handler without
-      // changing the client API. For now, the session ID check filters them.
+      unsubscribe();
     }
   }
 
@@ -109,6 +125,8 @@ export class ACPSession {
     } catch {
       // Session may already be gone — ignore
     }
+    // Notify manager to remove from registry
+    this.onDispose?.();
   }
 
   get isDisposed(): boolean {

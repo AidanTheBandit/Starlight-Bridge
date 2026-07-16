@@ -54,4 +54,10 @@ describe("isModelAllowed", () => {
     expect(isModelAllowed(token, "hermes-glm-5.2")).toBe(true);
     expect(isModelAllowed(token, "hermes-other")).toBe(false);
   });
+
+  it("treats ? as a literal character, not a wildcard", () => {
+    const token: Token = { token: "x", allowed_models: ["foo?bar"] };
+    expect(isModelAllowed(token, "foo?bar")).toBe(true);
+    expect(isModelAllowed(token, "fooxbar")).toBe(false);
+  });
 });

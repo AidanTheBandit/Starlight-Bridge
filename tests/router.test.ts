@@ -2,13 +2,14 @@ import { describe, it, expect } from "vitest";
 import { resolveACPClient, stripPrefix } from "../src/router.js";
 import type { Config } from "../src/config.js";
 
+// acp_clients pre-sorted by longest prefix (as loadConfig does)
 const mockConfig: Config = {
   server: { host: "0.0.0.0", port: 7878, tls: { enabled: false } },
   tokens: [],
   acp_clients: [
+    { model_prefix: "hermes-dev", command: "hermes-dev", args: ["acp"], env: {}, cwd: null },
     { model_prefix: "hermes", command: "hermes", args: ["acp"], env: {}, cwd: null },
     { model_prefix: "claude", command: "claude", args: [], env: {}, cwd: null },
-    { model_prefix: "hermes-dev", command: "hermes-dev", args: ["acp"], env: {}, cwd: null },
   ],
   sessions: { persist: true, idle_timeout: 300, max_sessions: 10 },
   mcp: { server_name: "starlight-bridge", cleanup_after_request: true },

@@ -9,17 +9,19 @@ const TLSSchema = z.object({
   enabled: z.boolean().default(false),
   cert: z.string().optional(),
   key: z.string().optional(),
+}).refine((data) => !data.enabled || (data.cert && data.key), {
+  message: "TLS cert and key are required when enabled is true",
 });
 
 const TokenSchema = z.object({
-  token: z.string(),
+  token: z.string().min(1, "Token must not be empty"),
   name: z.string().optional(),
   allowed_models: z.array(z.string()).default(["*"]),
 });
 
 const ACPClientSchema = z.object({
-  model_prefix: z.string(),
-  command: z.string(),
+  model_prefix: z.string().min(1),
+  command: z.string().min(1),
   args: z.array(z.string()).default([]),
   env: z.record(z.string()).default({}),
   cwd: z.string().nullable().default(null),
@@ -41,11 +43,15 @@ const ConfigSchema = z.object({
     host: z.string().default("0.0.0.0"),
     port: z.number().default(7878),
     tls: TLSSchema.default({ enabled: false }),
-  }),
-  tokens: z.array(TokenSchema),
-  acp_clients: z.array(ACPClientSchema),
+  }).default({ host: "0.0.0.0", port: 7878, tls: { enabled: false } }),
+  tokens: z.array(TokenSchema).min(1, "At least one token is required"),
+  acp_clients: z.array(ACPClientSchema).min(1, "At least one ACP client is required"),
   sessions: SessionsSchema.default({ persist: true, idle_timeout: 300, max_sessions: 10 }),
   mcp: MCPSchema.default({ server_name: "starlight-bridge", cleanup_after_request: true }),
+}).transform((config) => {
+  // Pre-sort acp_clients by longest prefix first (for longest-match routing)
+  config.acp_clients.sort((a, b) => b.model_prefix.length - a.model_prefix.length);
+  return config;
 });
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -69,7 +75,7 @@ export function loadConfig(path?: string): Config {
   } catch (e) {
     throw new Error(
       `Failed to load config from ${resolved}: ${(e as Error).message}\n` +
-      `Set STARLIGHT_CONFIG or create starlight.yml (see starlight.yml.example)`
+      `Set STARLIGHT_CONFIG or create starlight.yml (see starlight.yml.example)`,
     );
   }
 

@@ -2,7 +2,7 @@
 # Docs: https://github.com/AidanTheBandit/Starlight-Bridge
 
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"       # loopback by default — change to 0.0.0.0 only if you need external access
   port: 7878
   tls:
     enabled: false
@@ -10,8 +10,9 @@ server:
     # key: "/path/to/key.pem"
 
 # Authentication tokens for apps connecting to the bridge
+# Generate a random token: openssl rand -hex 32
 tokens:
-  - token: "change-me-to-a-random-string"
+  - token: "REPLACE_WITH_RANDOM_TOKEN"
     name: "My App"
     allowed_models:
       - "*"              # allow all models, or use globs like "hermes-*"

@@ -3,9 +3,12 @@ import { stream } from "hono/streaming";
 import type { ACPSession } from "../acp/session.js";
 import type { Config } from "../config.js";
 import type { OpenAIStreamChunk } from "./types.js";
+import { markIdle } from "../acp/manager.js";
 
 /**
  * Stream an ACP session response as OpenAI-compatible SSE.
+ * Caller must call markBusy(prefix) before invoking this.
+ * This function calls markIdle(prefix) when the stream completes.
  */
 export async function streamACPToOpenAI(
   c: Context,
@@ -13,6 +16,7 @@ export async function streamACPToOpenAI(
   prompt: string,
   model: string,
   config: Config,
+  modelPrefix?: string,
 ): Promise<Response> {
   const id = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -33,7 +37,7 @@ export async function streamACPToOpenAI(
       };
       await s.write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
-      // Stream content
+      // Stream content — onChunk is async and awaited by session.prompt
       await session.prompt(prompt, async (chunk: string) => {
         const contentChunk: OpenAIStreamChunk = {
           id,
@@ -75,6 +79,9 @@ export async function streamACPToOpenAI(
     } finally {
       if (config.mcp.cleanup_after_request) {
         await session.dispose().catch(() => {});
+      }
+      if (modelPrefix) {
+        markIdle(modelPrefix);
       }
     }
   });

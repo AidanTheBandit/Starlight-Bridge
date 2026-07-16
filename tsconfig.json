@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2023"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "outDir": "./dist",
@@ -11,7 +12,8 @@
     "resolveJsonModule": true,
     "declaration": true,
     "sourceMap": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "tests"]

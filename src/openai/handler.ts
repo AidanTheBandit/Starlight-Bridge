@@ -2,8 +2,8 @@ import type { Context } from "hono";
 import type { Config } from "../config.js";
 import { validateToken, isModelAllowed } from "../auth.js";
 import { resolveACPClient, stripPrefix } from "../router.js";
-import { createSession } from "../acp/manager.js";
-import type { OpenAIRequest, OpenAIResponse, OpenAIError } from "./types.js";
+import { createSession, markBusy, markIdle } from "../acp/manager.js";
+import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
 
 function errorResponse(c: Context, status: number, message: string, type: string) {
@@ -64,13 +64,26 @@ export async function handleChatCompletions(c: Context, config: Config) {
   const agentModel = stripPrefix(body.model, acpClient.model_prefix);
 
   // ── Build MCP servers from client-provided tools ──────────────────
-  const mcpServers = body.tools && body.tools.length > 0
+  // Validate tools array: filter out entries lacking a valid function object
+  const validTools: OpenAITool[] = Array.isArray(body.tools)
+    ? body.tools.filter(
+        (t): t is OpenAITool =>
+          t != null &&
+          typeof t === "object" &&
+          t.type === "function" &&
+          t.function != null &&
+          typeof t.function.name === "string" &&
+          t.function.name.length > 0,
+      )
+    : [];
+
+  const scheme = config.server.tls?.enabled ? "https" : "http";
+  const mcpServers = validTools.length > 0
     ? [{
         name: config.mcp.server_name,
-        // HTTP transport so ACP can reach back to the bridge
-        url: `http://127.0.0.1:${config.server.port}/mcp`,
-        // Include tool schemas for the agent to see
-        tools: body.tools.map((t) => ({
+        // HTTP/SSE transport so ACP can reach back to the bridge
+        url: `${scheme}://127.0.0.1:${config.server.port}/mcp`,
+        tools: validTools.map((t) => ({
           name: t.function.name,
           description: t.function.description ?? "",
           inputSchema: t.function.parameters ?? { type: "object", properties: {} },
@@ -96,9 +109,7 @@ export async function handleChatCompletions(c: Context, config: Config) {
   }
 
   // ── Extract user prompt ───────────────────────────────────────────
-  // Use the last user message as the prompt. Prior messages become
-  // conversation context (handled by ACP session history).
-  const lastUser = [...body.messages].reverse().find((m) => m.role === "user");
+  const lastUser = body.messages.findLast((m) => m.role === "user");
   if (!lastUser || !lastUser.content) {
     await session.dispose().catch(() => {});
     return errorResponse(c, 400, "No user message found in messages array", "invalid_request");
@@ -108,10 +119,13 @@ export async function handleChatCompletions(c: Context, config: Config) {
 
   // ── Stream or non-stream response ─────────────────────────────────
   if (body.stream) {
-    return streamACPToOpenAI(c, session, promptText, body.model, config);
+    // markBusy here; markIdle happens in stream's finally
+    markBusy(acpClient.model_prefix);
+    return streamACPToOpenAI(c, session, promptText, body.model, config, acpClient.model_prefix);
   }
 
   // Non-streaming
+  markBusy(acpClient.model_prefix);
   try {
     const responseText = await session.prompt(promptText);
 
@@ -144,5 +158,7 @@ export async function handleChatCompletions(c: Context, config: Config) {
       `ACP agent error: ${(err as Error).message}`,
       "backend_error",
     );
+  } finally {
+    markIdle(acpClient.model_prefix);
   }
 }

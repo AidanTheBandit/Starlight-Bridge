@@ -28,7 +28,8 @@ export class ACPClientWrapper {
     timer: ReturnType<typeof setTimeout>;
   }>();
   private buffer = "";
-  private notificationHandlers = new Map<string, ((params: unknown) => void)[]>();
+  private notificationHandlers = new Map<string, Set<(params: unknown) => void>>();
+  private dead = false;
 
   constructor(
     private proc: ChildProcess,
@@ -41,6 +42,19 @@ export class ACPClientWrapper {
     this.proc.stderr?.on("data", (chunk: Buffer) => {
       console.error(`[ACP ${label}]`, chunk.toString().trim());
     });
+
+    // Reject all pending RPCs on process death
+    this.proc.on("exit", () => this.failAll("process exited"));
+    this.proc.on("error", (err) => this.failAll(`process error: ${err.message}`));
+  }
+
+  private failAll(reason: string): void {
+    this.dead = true;
+    for (const [id, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(`ACP ${this.label}: ${reason}`));
+      this.pending.delete(id);
+    }
   }
 
   private processBuffer(): void {
@@ -64,9 +78,11 @@ export class ACPClientWrapper {
           }
         } else if (msg.method) {
           // Notification (no id)
-          const handlers = this.notificationHandlers.get(msg.method) ?? [];
-          for (const handler of handlers) {
-            handler(msg.params);
+          const handlers = this.notificationHandlers.get(msg.method);
+          if (handlers) {
+            for (const handler of handlers) {
+              handler(msg.params);
+            }
           }
         }
       } catch {
@@ -75,13 +91,32 @@ export class ACPClientWrapper {
     }
   }
 
-  onNotification(method: string, handler: (params: unknown) => void): void {
-    const existing = this.notificationHandlers.get(method) ?? [];
-    existing.push(handler);
-    this.notificationHandlers.set(method, existing);
+  /**
+   * Register a notification handler. Returns an unsubscribe function.
+   */
+  onNotification(method: string, handler: (params: unknown) => void): () => void {
+    let handlers = this.notificationHandlers.get(method);
+    if (!handlers) {
+      handlers = new Set();
+      this.notificationHandlers.set(method, handlers);
+    }
+    handlers.add(handler);
+    return () => {
+      handlers!.delete(handler);
+      if (handlers!.size === 0) {
+        this.notificationHandlers.delete(method);
+      }
+    };
   }
 
   async rpc<T = unknown>(method: string, params?: unknown, timeoutMs = 60_000): Promise<T> {
+    if (this.dead) {
+      throw new Error(`ACP ${this.label}: process is dead`);
+    }
+    if (!this.proc.stdin || this.proc.stdin.destroyed) {
+      throw new Error(`ACP ${this.label}: stdin unavailable`);
+    }
+
     const id = this.nextId++;
     const req: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
 
@@ -99,15 +134,26 @@ export class ACPClientWrapper {
         timer,
       });
 
-      this.proc.stdin?.write(JSON.stringify(req) + "\n");
+      try {
+        const ok = this.proc.stdin!.write(JSON.stringify(req) + "\n");
+        if (!ok) {
+          // Backpressure — wait for drain, but don't block the promise
+          this.proc.stdin!.once("drain", () => {});
+        }
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new Error(`ACP ${this.label}: write failed: ${(err as Error).message}`));
+      }
     });
   }
 
   get isAlive(): boolean {
-    return this.proc.exitCode === null && this.proc.killed === false;
+    return !this.dead && this.proc.exitCode === null && this.proc.killed === false;
   }
 
   kill(): void {
+    this.failAll("killed");
     this.proc.kill();
   }
 }
