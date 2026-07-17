@@ -1,4 +1,4 @@
-import { createDynamicMcpServer } from "./store.js";
+import { getToolsForScope } from "./store.js";
 import type { Config } from "../config.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
@@ -17,10 +17,8 @@ import { Readable } from "node:stream";
 export async function handleMcpRequest(
   request: Request,
   config: Config,
+  scope?: string,
 ): Promise<Response> {
-  // For stateless mode, create a fresh server per request
-  const server = createDynamicMcpServer();
-
   try {
     // For now, handle the MCP protocol at the HTTP level manually.
     // This is simpler than trying to adapt Hono Request → Node IncomingMessage.
@@ -50,9 +48,7 @@ export async function handleMcpRequest(
     }
 
     if (jsonrpc.method === "tools/list") {
-      // Import the registry dynamically to get current tools
-      const { toolRegistry } = await import("./store.js");
-      const toolsList = Array.from(toolRegistry.values()).map((t) => ({
+      const toolsList = Array.from(getToolsForScope(scope).values()).map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
@@ -65,9 +61,8 @@ export async function handleMcpRequest(
     }
 
     if (jsonrpc.method === "tools/call") {
-      const { toolRegistry } = await import("./store.js");
       const params = jsonrpc.params as { name: string; arguments?: Record<string, unknown> };
-      const tool = toolRegistry.get(params.name);
+      const tool = getToolsForScope(scope).get(params.name);
 
       if (!tool) {
         return Response.json({

@@ -1,10 +1,10 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { Config } from "./config.js";
 import { handleChatCompletions } from "./openai/handler.js";
 import { getStatus } from "./acp/manager.js";
-import { setTools, clearTools, getToolNames } from "./mcp/store.js";
+import { getToolNames } from "./mcp/store.js";
 import { handleMcpRequest } from "./mcp/server.js";
-import type { OpenAIModelList, OpenAITool } from "./openai/types.js";
+import type { OpenAIModelList } from "./openai/types.js";
 
 /**
  * Create the Hono app with all routes.
@@ -49,6 +49,9 @@ export function createApp(config: Config): Hono {
     const req = c.req.raw;
     const response = await handleMcpRequest(req, config);
     return response;
+  });
+  app.all("/mcp/:scope", async (c: Context) => {
+    return handleMcpRequest(c.req.raw, config, c.req.param("scope"));
   });
 
   // ── Catch-all ─────────────────────────────────────────────────────
