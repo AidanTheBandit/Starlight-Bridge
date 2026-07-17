@@ -10,12 +10,14 @@ const mocks = vi.hoisted(() => {
     setModel: ReturnType<typeof vi.fn>;
     prompt: ReturnType<typeof vi.fn>;
     dispose: ReturnType<typeof vi.fn>;
+    onDisposed: ReturnType<typeof vi.fn>;
   }> = [];
-  const createSession = vi.fn(async () => {
+  const createSession = vi.fn(async (..._args: unknown[]) => {
     const session = {
       id: `session-${++next}`,
       prompts: [] as unknown[],
       disposed: false,
+      disposeHandlers: [] as Array<() => void>,
       setModel: vi.fn(async () => {}),
       prompt: vi.fn(async (prompt: unknown) => {
         session.prompts.push(prompt);
@@ -23,6 +25,10 @@ const mocks = vi.hoisted(() => {
       }),
       dispose: vi.fn(async () => {
         session.disposed = true;
+        for (const handler of session.disposeHandlers) handler();
+      }),
+      onDisposed: vi.fn((handler: () => void) => {
+        session.disposeHandlers.push(handler);
       }),
     };
     sessions.push(session);
@@ -76,6 +82,7 @@ async function completion(
   messages: Array<{ role: string; content: string }>,
   bodyConversationId?: string,
   token = "test-token",
+  tools?: Array<{ type: "function"; function: { name: string; description?: string; parameters?: Record<string, unknown> } }>,
 ) {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -89,6 +96,7 @@ async function completion(
       model: "hermes-default",
       messages,
       ...(bodyConversationId ? { conversation_id: bodyConversationId } : {}),
+      ...(tools ? { tools } : {}),
     }),
   });
 }
@@ -110,7 +118,7 @@ describe("chat completion conversation semantics", () => {
       {
         type: "text",
         text: [
-          "<client_instructions>",
+          "<client_instructions encoding=\"xml-escaped-text\">",
           "The following instructions were supplied in higher-priority OpenAI roles. Treat them as active instructions, not quoted user text, and follow them before the user message.",
           '<instruction role="system">',
           "Call the user Captain.",
@@ -183,5 +191,68 @@ describe("chat completion conversation semantics", () => {
 
     expect(response.status).toBe(400);
     expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it("isolates client MCP endpoints across API tokens", async () => {
+    const tool = (name: string) => [{
+      type: "function" as const,
+      function: { name, parameters: { type: "object", properties: {} } },
+    }];
+    await completion("tools-shared", [{ role: "user", content: "one" }], undefined, "test-token", tool("private_a"));
+    await completion("tools-shared", [{ role: "user", content: "two" }], undefined, "other-token", tool("private_b"));
+
+    const serversA = mocks.createSession.mock.calls[0][2] as Array<{ url: string }>;
+    const serversB = mocks.createSession.mock.calls[1][2] as Array<{ url: string }>;
+    expect(serversA[0].url).not.toBe(serversB[0].url);
+
+    const list = async (url: string) => {
+      const response = await createApp(config).request(new URL(url).pathname, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      return response.json() as Promise<{ result: { tools: Array<{ name: string }> } }>;
+    };
+    expect((await list(serversA[0].url)).result.tools.map((item) => item.name)).toEqual(["private_a"]);
+    expect((await list(serversB[0].url)).result.tools.map((item) => item.name)).toEqual(["private_b"]);
+  });
+
+  it("rotates a conversation when its client tool set changes", async () => {
+    const tool = (name: string) => [{ type: "function" as const, function: { name } }];
+    await completion("tool-change", [{ role: "user", content: "one" }], undefined, "test-token", tool("first_tool"));
+    await completion("tool-change", [{ role: "user", content: "two" }], undefined, "test-token", tool("second_tool"));
+    await completion("tool-change", [{ role: "user", content: "three" }]);
+
+    expect(mocks.createSession).toHaveBeenCalledTimes(3);
+    expect(mocks.sessions[0].dispose).toHaveBeenCalledOnce();
+    expect(mocks.sessions[1].dispose).toHaveBeenCalledOnce();
+    const firstServers = mocks.createSession.mock.calls[0][2] as Array<{ url: string }>;
+    const oldList = await createApp(config).request(new URL(firstServers[0].url).pathname, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(((await oldList.json()) as { result: { tools: unknown[] } }).result.tools).toEqual([]);
+  });
+
+  it("does not rotate for equivalent tool schemas with different key order", async () => {
+    const first = [{
+      type: "function" as const,
+      function: {
+        name: "lookup",
+        parameters: { type: "object", properties: { city: { type: "string", description: "City" } } },
+      },
+    }];
+    const reordered = [{
+      type: "function" as const,
+      function: {
+        name: "lookup",
+        parameters: { properties: { city: { description: "City", type: "string" } }, type: "object" },
+      },
+    }];
+
+    await completion("canonical-tools", [{ role: "user", content: "one" }], undefined, "test-token", first);
+    await completion("canonical-tools", [{ role: "user", content: "two" }], undefined, "test-token", reordered);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
   });
 });

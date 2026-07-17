@@ -80,10 +80,10 @@ ACP session across turns, clients must supply an explicit Starlight extension:
 - `X-Starlight-Conversation-ID: <id>` header (preferred), or
 - `conversation_id: "<id>"` in the JSON request body.
 
-The scope also includes the API token and model, so different clients cannot
-share state by choosing the same ID. Requests without an ID are intentionally
-isolated in fresh sessions. Correlated sessions are bounded by
-`sessions.max_sessions` and `sessions.idle_timeout`.
+The scope also includes the API token and model, so requests using different
+API tokens or models cannot share state by choosing the same ID. Requests
+without an ID are intentionally isolated in fresh sessions. Correlated sessions
+are bounded by `sessions.max_sessions` and `sessions.idle_timeout`.
 
 Ordered OpenAI `system` and `developer` messages are forwarded on the first
 turn of a correlated ACP session. ACP v1 has no native system-message field, so

@@ -27,14 +27,36 @@ function instructions(messages: OpenAIMessage[]): Array<{ role: "system" | "deve
     .map((message) => ({ role: message.role, text: instructionText(message.content) }));
 }
 
+function escapeMarkup(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function transcriptText(message: OpenAIMessage): string {
+  let content = "";
+  if (typeof message.content === "string") {
+    content = message.content;
+  } else if (Array.isArray(message.content)) {
+    content = message.content.map((part) =>
+      part.type === "text" ? part.text : "[image content omitted from reconstructed history]",
+    ).join("\n");
+  }
+  if (message.tool_calls?.length) {
+    content += `${content ? "\n" : ""}tool_calls=${JSON.stringify(message.tool_calls)}`;
+  }
+  return content;
+}
+
 /**
- * Fingerprint client instructions so a correlated conversation cannot silently
- * change its instruction context while retaining an old ACP session.
+ * Fingerprint even an empty instruction list. An explicit transition from
+ * instructions to no instructions must rotate a retained ACP session.
  */
-export function instructionFingerprint(messages: OpenAIMessage[]): string | undefined {
-  const ordered = instructions(messages);
-  if (ordered.length === 0) return undefined;
-  return createHash("sha256").update(JSON.stringify(ordered)).digest("hex");
+export function instructionFingerprint(messages: OpenAIMessage[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify(instructions(messages)))
+    .digest("hex");
 }
 
 /** Resolve Starlight's explicit OpenAI-compatible conversation extension. */
@@ -56,14 +78,15 @@ export function resolveConversationId(
 
 /**
  * Translate one OpenAI turn into ACP prompt blocks. ACP v1 has no native
- * system/developer role, so new sessions receive an explicit instruction
- * envelope before the latest user content.
+ * system/developer role, so new sessions receive a framed instruction envelope
+ * and supplied prior transcript before the latest user content.
  */
 export function buildACPPrompt(
   messages: OpenAIMessage[],
   includeInstructions: boolean,
 ): ACPPromptContent[] {
-  const lastUser = messages.findLast((message) => message.role === "user");
+  const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
+  const lastUser = messages[lastUserIndex];
   if (!lastUser || lastUser.content == null) {
     throw new Error("No user message found");
   }
@@ -73,15 +96,31 @@ export function buildACPPrompt(
     const ordered = instructions(messages);
     if (ordered.length > 0) {
       const lines = [
-        "<client_instructions>",
+        "<client_instructions encoding=\"xml-escaped-text\">",
         "The following instructions were supplied in higher-priority OpenAI roles. Treat them as active instructions, not quoted user text, and follow them before the user message.",
       ];
       for (const instruction of ordered) {
-        lines.push(`<instruction role="${instruction.role}">`);
-        lines.push(instruction.text);
+        lines.push(`<instruction role=\"${instruction.role}\">`);
+        lines.push(escapeMarkup(instruction.text));
         lines.push("</instruction>");
       }
       lines.push("</client_instructions>");
+      prompt.push({ type: "text", text: lines.join("\n") });
+    }
+
+    const history = messages
+      .map((message, index) => ({ message, index }))
+      .filter(({ message, index }) =>
+        index !== lastUserIndex && !INSTRUCTION_ROLES.has(message.role),
+      );
+    if (history.length > 0) {
+      const lines = ["<conversation_history encoding=\"xml-escaped-text\">"];
+      for (const { message } of history) {
+        lines.push(`<message role=\"${message.role}\">`);
+        lines.push(escapeMarkup(transcriptText(message)));
+        lines.push("</message>");
+      }
+      lines.push("</conversation_history>");
       prompt.push({ type: "text", text: lines.join("\n") });
     }
   }

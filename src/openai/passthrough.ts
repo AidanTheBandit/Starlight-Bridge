@@ -31,6 +31,8 @@ export async function passthrough(c: Context, config: Config): Promise<Response>
     delete bodyJson.tools;
     delete bodyJson.tool_choice;
   }
+  // Starlight's correlation extension is not part of the OpenAI schema.
+  delete bodyJson.conversation_id;
 
   const upstreamUrl = config.passthrough.upstream_url + "/v1/chat/completions";
   const upstreamKey = config.passthrough.upstream_key;

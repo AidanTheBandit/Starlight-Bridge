@@ -11,7 +11,7 @@ export type ACPPromptContent =
  */
 export class ACPSession {
   private disposed = false;
-  private onDispose?: () => void;
+  private readonly disposeHandlers: Array<() => void> = [];
   private promptQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -19,7 +19,7 @@ export class ACPSession {
     private client: ACPClientWrapper,
     onDispose?: () => void,
   ) {
-    this.onDispose = onDispose;
+    if (onDispose) this.disposeHandlers.push(onDispose);
   }
 
   /**
@@ -45,7 +45,8 @@ export class ACPSession {
     }
 
     let streamedText = "";
-    const chunkPromises: Promise<void>[] = [];
+    let chunkWrites: Promise<void> = Promise.resolve();
+    let chunkWriteError: unknown;
 
     const handler = (params: unknown) => {
       const p = params as {
@@ -66,10 +67,11 @@ export class ACPSession {
           if (block.type === "text" && block.text) {
             streamedText += block.text;
             if (onChunk) {
-              const result = onChunk(block.text);
-              if (result instanceof Promise) {
-                chunkPromises.push(result);
-              }
+              chunkWrites = chunkWrites
+                .then(() => onChunk(block.text!))
+                .catch((err) => {
+                  chunkWriteError ??= err;
+                });
             }
           }
         }
@@ -89,10 +91,9 @@ export class ACPSession {
         prompt,
       }, 300_000);
 
-      // Await any pending async onChunk callbacks
-      if (chunkPromises.length > 0) {
-        await Promise.all(chunkPromises);
-      }
+      // Preserve write order and surface the first streaming write failure.
+      await chunkWrites;
+      if (chunkWriteError) throw chunkWriteError;
 
       return streamedText;
     } finally {
@@ -123,7 +124,12 @@ export class ACPSession {
     } catch {
       // Session may already be gone or method unsupported — ignore
     }
-    this.onDispose?.();
+    for (const handler of this.disposeHandlers) handler();
+  }
+
+  onDisposed(handler: () => void): void {
+    if (this.disposed) handler();
+    else this.disposeHandlers.push(handler);
   }
 
   get isDisposed(): boolean {
