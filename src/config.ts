@@ -59,6 +59,35 @@ const PassthroughSchema = z.object({
   strip_tools: z.boolean().default(true),
 });
 
+/**
+ * Rapid mode: answer simple prompts with a fast OpenAI-compatible model first.
+ * The rapid model only gets an escalate_to_agent tool. If it escalates (or fails),
+ * Starlight falls through to the normal ACP path. Disabled by default so generic
+ * installs stay ACP-only.
+ */
+const RapidSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** OpenAI-compatible chat completions base URL (no trailing /v1/chat/completions). */
+  base_url: z.string().default("https://generativelanguage.googleapis.com/v1beta/openai"),
+  /** API key. Prefer STARLIGHT_RAPID_API_KEY env over committing secrets. */
+  api_key: z.string().default(""),
+  /** Upstream model id for the fast path. */
+  model: z.string().default("gemini-3-flash-preview"),
+  /** Tool name the fast model must call to hand control to ACP. */
+  escalate_tool: z.string().default("escalate_to_agent"),
+  /** Request timeout in ms for the rapid call. */
+  timeout_ms: z.number().default(12_000),
+  /**
+   * Extra system instruction describing rapid-mode limits.
+   * Keep product-specific wording out of core defaults.
+   */
+  system_prompt: z.string().default(
+    "You are the fast path. Answer only simple, self-contained questions you can solve immediately without tools, device access, browsing, code execution, or multi-step planning. " +
+    "If the user needs tools, current facts you do not know, device control, multi-step work, or you are unsure, call escalate_to_agent with a short reason. " +
+    "Do not invent tool results. Prefer escalate_to_agent over guessing.",
+  ),
+});
+
 const ConfigSchema = z.object({
   server: z.object({
     host: z.string().default("0.0.0.0"),
@@ -77,9 +106,25 @@ const ConfigSchema = z.object({
   }),
   // Default passthrough OFF so ACP+MCP tools are available to Hermes.
   passthrough: PassthroughSchema.default({ enabled: false, upstream_url: "http://127.0.0.1:8642", upstream_key: "", strip_tools: true }),
+  rapid: RapidSchema.default({
+    enabled: false,
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    api_key: "",
+    model: "gemini-3-flash-preview",
+    escalate_tool: "escalate_to_agent",
+    timeout_ms: 12_000,
+    system_prompt:
+      "You are the fast path. Answer only simple, self-contained questions you can solve immediately without tools, device access, browsing, code execution, or multi-step planning. " +
+      "If the user needs tools, current facts you do not know, device control, multi-step work, or you are unsure, call escalate_to_agent with a short reason. " +
+      "Do not invent tool results. Prefer escalate_to_agent over guessing.",
+  }),
 }).transform((config) => {
   // Pre-sort acp_clients by longest prefix first (for longest-match routing)
   config.acp_clients.sort((a, b) => b.model_prefix.length - a.model_prefix.length);
+  // Env wins for secrets so local configs can omit the key.
+  if (process.env.STARLIGHT_RAPID_API_KEY) {
+    config.rapid.api_key = process.env.STARLIGHT_RAPID_API_KEY;
+  }
   return config;
 });
 

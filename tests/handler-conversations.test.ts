@@ -75,6 +75,16 @@ const config: Config = {
     upstream_key: "",
     strip_tools: true,
   },
+  rapid: {
+    enabled: false,
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    api_key: "",
+    model: "gemini-3-flash-preview",
+    escalate_tool: "escalate_to_agent",
+    timeout_ms: 12000,
+    system_prompt: "fast path",
+  },
+
 };
 
 async function completion(

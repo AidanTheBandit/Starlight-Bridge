@@ -4,6 +4,8 @@ Bridge any ACP-compatible agent to the OpenAI API, with dynamic MCP tool registr
 
 Any app that speaks OpenAI can talk to Hermes, Claude Code, or any other ACP agent through Starlight. Client-provided tools are registered as MCP tools in the agent session automatically.
 
+Optional **rapid mode** can answer simple prompts with a fast OpenAI-compatible model first. That model only gets an `escalate_to_agent` tool; if it escalates (or fails), Starlight falls through to the normal ACP path. Rapid mode is disabled by default.
+
 ## Quick Start (with your AI agent)
 
 Send this prompt to your AI agent (Claude Code, Hermes, Codex, etc.):

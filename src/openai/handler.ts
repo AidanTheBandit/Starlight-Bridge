@@ -15,6 +15,7 @@ import {
 import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
 import { passthrough } from "./passthrough.js";
+import { rapidAnswerResponse, tryRapid } from "./rapid.js";
 import { buildACPPrompt, instructionFingerprint, resolveConversationId } from "./messages.js";
 
 const DEFERRED_VISION_MARKER = "__HUMANE_DEFERRED_VISION__";
@@ -88,6 +89,20 @@ export async function handleChatCompletions(c: Context, config: Config) {
   }
 
   if (config.passthrough.enabled) return passthrough(c, config);
+
+  // Rapid path: fast OpenAI-compatible model answers simple prompts immediately.
+  // On escalate/skip/error we fall through to the normal ACP agent path.
+  // Streaming requests always use ACP so tool/agent turns remain stream-compatible.
+  if (config.rapid?.enabled && !body.stream) {
+    const rapid = await tryRapid(body, config);
+    if (rapid.kind === "answer") {
+      console.log(`[rapid] answered model=${rapid.model}`);
+      return c.json(rapidAnswerResponse(body.model, rapid.content, rapid.model));
+    }
+    if (rapid.kind === "escalate") {
+      console.log(`[rapid] escalate → acp reason=${rapid.reason}`);
+    }
+  }
 
   const acpClient = resolveACPClient(config, body.model);
   if (!acpClient) return errorResponse(c, 404, `No ACP client for model: ${body.model}`, "no_backend");
