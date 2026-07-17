@@ -7,6 +7,7 @@ import { setTools } from "../mcp/store.js";
 import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
 import { passthrough } from "./passthrough.js";
+import { openAIContentToACP } from "./content.js";
 
 /** Must match penumbra dumb_backend DEFERRED_VISION_MARKER */
 const DEFERRED_VISION_MARKER = "__HUMANE_DEFERRED_VISION__";
@@ -107,14 +108,22 @@ export async function handleChatCompletions(c: Context, config: Config) {
     return errorResponse(c, 400, "No user message found", "invalid_request");
   }
 
+  let prompt;
+  try {
+    prompt = openAIContentToACP(lastUser.content);
+  } catch (err) {
+    await session.dispose().catch(() => {});
+    return errorResponse(c, 400, (err as Error).message, "invalid_request");
+  }
+
   if (body.stream) {
     markBusy(acpClient.model_prefix);
-    return streamACPToOpenAI(c, session, lastUser.content, body.model, config, acpClient.model_prefix);
+    return streamACPToOpenAI(c, session, prompt, body.model, config, acpClient.model_prefix);
   }
 
   markBusy(acpClient.model_prefix);
   try {
-    let responseText = await session.prompt(lastUser.content);
+    let responseText = await session.prompt(prompt);
     if (config.mcp.cleanup_after_request) {
       await session.dispose().catch(() => {});
     }
