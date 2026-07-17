@@ -6,6 +6,11 @@ import { createSession, markBusy, markIdle } from "../acp/manager.js";
 import { setTools } from "../mcp/store.js";
 import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
+import { passthrough } from "./passthrough.js";
+import { openAIContentToACP } from "./content.js";
+
+/** Must match penumbra dumb_backend DEFERRED_VISION_MARKER */
+const DEFERRED_VISION_MARKER = "__HUMANE_DEFERRED_VISION__";
 
 function errorResponse(c: Context, status: number, message: string, type: string) {
   const body: OpenAIError = { error: { message, type } };
@@ -39,6 +44,12 @@ export async function handleChatCompletions(c: Context, config: Config) {
     return errorResponse(c, 403, `Token not authorized for model: ${body.model}`, "model_forbidden");
   }
 
+  // ── Passthrough mode: proxy straight to upstream LLM API ──────────
+  if (config.passthrough.enabled) {
+    return passthrough(c, config);
+  }
+
+  // ── ACP mode: spawn agent, register MCP tools ─────────────────────
   const acpClient = resolveACPClient(config, body.model);
   if (!acpClient) {
     return errorResponse(c, 404, `No ACP client for model: ${body.model}`, "no_backend");
@@ -46,8 +57,7 @@ export async function handleChatCompletions(c: Context, config: Config) {
 
   const agentModel = stripPrefix(body.model, acpClient.model_prefix);
 
-  // ── Register tools as MCP server ──────────────────────────────────
-  // Validate and convert OpenAI tools to MCP tool registry
+  // Register tools as MCP
   const validTools: OpenAITool[] = Array.isArray(body.tools)
     ? body.tools.filter(
         (t): t is OpenAITool =>
@@ -70,9 +80,10 @@ export async function handleChatCompletions(c: Context, config: Config) {
     );
   }
 
-  // ── Create session with MCP server reference ──────────────────────
-  // The ACP agent connects to our /mcp endpoint to discover tools
-  const mcpServers = validTools.length > 0
+  // Always pass MCP server if tools exist
+  const { toolRegistry } = await import("../mcp/store.js");
+  const hasTools = validTools.length > 0 || toolRegistry.size > 0;
+  const mcpServers = hasTools
     ? [{
         name: config.mcp.server_name,
         type: "http" as const,
@@ -97,16 +108,30 @@ export async function handleChatCompletions(c: Context, config: Config) {
     return errorResponse(c, 400, "No user message found", "invalid_request");
   }
 
+  let prompt;
+  try {
+    prompt = openAIContentToACP(lastUser.content);
+  } catch (err) {
+    await session.dispose().catch(() => {});
+    return errorResponse(c, 400, (err as Error).message, "invalid_request");
+  }
+
   if (body.stream) {
     markBusy(acpClient.model_prefix);
-    return streamACPToOpenAI(c, session, lastUser.content, body.model, config, acpClient.model_prefix);
+    return streamACPToOpenAI(c, session, prompt, body.model, config, acpClient.model_prefix);
   }
 
   markBusy(acpClient.model_prefix);
   try {
-    const responseText = await session.prompt(lastUser.content);
+    let responseText = await session.prompt(prompt);
     if (config.mcp.cleanup_after_request) {
       await session.dispose().catch(() => {});
+    }
+
+    // If Hermes decided the pin needs the camera, collapse to the exact sentinel
+    // penumbra dumb mode maps to ChatResult::DeferredVision → UnderstandScene action.
+    if (responseText.includes(DEFERRED_VISION_MARKER)) {
+      responseText = DEFERRED_VISION_MARKER;
     }
 
     const response: OpenAIResponse = {

@@ -1,5 +1,9 @@
 import type { ACPClientWrapper } from "./client.js";
 
+export type ACPPromptContent =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; data: string; uri?: string };
+
 /**
  * An ACP session — a conversation context within an ACP agent process.
  *
@@ -23,7 +27,7 @@ export class ACPSession {
    * Async onChunk callbacks are awaited before prompt() returns.
    */
   async prompt(
-    text: string,
+    content: string | ACPPromptContent[],
     onChunk?: (chunk: string) => void | Promise<void>,
   ): Promise<string> {
     if (this.disposed) {
@@ -65,11 +69,14 @@ export class ACPSession {
     const unsubscribe = this.client.onNotification("session/update", handler);
 
     try {
+      const prompt: ACPPromptContent[] = typeof content === "string"
+        ? [{ type: "text", text: content }]
+        : content;
       const result = await this.client.rpc<{
         stopReason?: string;
       }>("session/prompt", {
         sessionId: this.sessionId,
-        prompt: [{ type: "text", text }],
+        prompt,
       }, 300_000);
 
       // Await any pending async onChunk callbacks

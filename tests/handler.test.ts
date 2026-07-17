@@ -11,7 +11,19 @@ const mockConfig: Config = {
     { model_prefix: "hermes", command: "hermes", args: ["acp"], env: {}, cwd: null },
   ],
   sessions: { persist: true, idle_timeout: 300, max_sessions: 10 },
-  mcp: { server_name: "starlight-bridge", cleanup_after_request: true },
+  mcp: {
+    server_name: "starlight-bridge",
+    cleanup_after_request: true,
+    pin_tools: true,
+    pin_base_url: "http://penumbra.local:8080",
+    photo_max_base64_chars: 350_000,
+  },
+  passthrough: {
+    enabled: false,
+    upstream_url: "http://127.0.0.1:8642",
+    upstream_key: "",
+    strip_tools: true,
+  },
 };
 
 describe("HTTP endpoints", () => {

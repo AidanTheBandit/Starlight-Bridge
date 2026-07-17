@@ -1,6 +1,6 @@
 import type { Context } from "hono";
 import { stream } from "hono/streaming";
-import type { ACPSession } from "../acp/session.js";
+import type { ACPSession, ACPPromptContent } from "../acp/session.js";
 import type { Config } from "../config.js";
 import type { OpenAIStreamChunk } from "./types.js";
 import { markIdle } from "../acp/manager.js";
@@ -13,7 +13,7 @@ import { markIdle } from "../acp/manager.js";
 export async function streamACPToOpenAI(
   c: Context,
   session: ACPSession,
-  prompt: string,
+  prompt: ACPPromptContent[],
   model: string,
   config: Config,
   modelPrefix?: string,

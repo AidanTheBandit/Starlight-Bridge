@@ -21,9 +21,19 @@ export interface RegisteredTool {
 const toolRegistry = new Map<string, RegisteredTool>();
 
 /**
- * Register tools, replacing any existing set.
+ * Register tools. Merges with existing tools (doesn't clear).
+ * If a tool with the same name already exists, it's overwritten.
  */
 export function setTools(newTools: RegisteredTool[]): void {
+  for (const tool of newTools) {
+    toolRegistry.set(tool.name, tool);
+  }
+}
+
+/**
+ * Register tools, replacing the entire set.
+ */
+export function replaceTools(newTools: RegisteredTool[]): void {
   toolRegistry.clear();
   for (const tool of newTools) {
     toolRegistry.set(tool.name, tool);

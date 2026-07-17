@@ -2,11 +2,20 @@
 
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool" | "function";
-  content: string | null;
+  content: OpenAIMessageContent;
   name?: string;
   tool_call_id?: string;
   tool_calls?: OpenAIToolCall[];
 }
+
+export type OpenAIMessageContent = string | OpenAIContentPart[] | null;
+
+export type OpenAIContentPart =
+  | { type: "text"; text: string }
+  | {
+      type: "image_url";
+      image_url: string | { url: string; detail?: "auto" | "low" | "high" };
+    };
 
 export interface OpenAIToolCall {
   id: string;
