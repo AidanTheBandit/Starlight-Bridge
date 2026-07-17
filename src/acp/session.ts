@@ -12,6 +12,7 @@ export type ACPPromptContent =
 export class ACPSession {
   private disposed = false;
   private onDispose?: () => void;
+  private promptQueue: Promise<void> = Promise.resolve();
 
   constructor(
     public readonly sessionId: string,
@@ -27,6 +28,15 @@ export class ACPSession {
    * Async onChunk callbacks are awaited before prompt() returns.
    */
   async prompt(
+    content: string | ACPPromptContent[],
+    onChunk?: (chunk: string) => void | Promise<void>,
+  ): Promise<string> {
+    const result = this.promptQueue.then(() => this.executePrompt(content, onChunk));
+    this.promptQueue = result.then(() => {}, () => {});
+    return result;
+  }
+
+  private async executePrompt(
     content: string | ACPPromptContent[],
     onChunk?: (chunk: string) => void | Promise<void>,
   ): Promise<string> {
@@ -118,5 +128,9 @@ export class ACPSession {
 
   get isDisposed(): boolean {
     return this.disposed;
+  }
+
+  get isUsable(): boolean {
+    return !this.disposed && this.client.isAlive;
   }
 }

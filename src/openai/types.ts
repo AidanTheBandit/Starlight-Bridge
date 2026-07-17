@@ -1,7 +1,7 @@
 // ─── OpenAI-compatible request/response types ────────────────────────
 
 export interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool" | "function";
+  role: "system" | "developer" | "user" | "assistant" | "tool" | "function";
   content: OpenAIMessageContent;
   name?: string;
   tool_call_id?: string;
@@ -48,6 +48,8 @@ export interface OpenAIRequest {
   stop?: string | string[];
   presence_penalty?: number;
   frequency_penalty?: number;
+  /** Starlight extension: explicit conversation correlation key. */
+  conversation_id?: string;
   user?: string;
 }
 

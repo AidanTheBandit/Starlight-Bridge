@@ -1,16 +1,20 @@
 import type { Context } from "hono";
+import { createHash } from "node:crypto";
 import type { Config } from "../config.js";
 import { validateToken, isModelAllowed } from "../auth.js";
 import { resolveACPClient, stripPrefix } from "../router.js";
 import { createSession, markBusy, markIdle } from "../acp/manager.js";
+import { ConversationRegistry } from "../acp/conversations.js";
+import type { ACPSession } from "../acp/session.js";
 import { setTools } from "../mcp/store.js";
 import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
 import { passthrough } from "./passthrough.js";
-import { openAIContentToACP } from "./content.js";
+import { buildACPPrompt, instructionFingerprint, resolveConversationId } from "./messages.js";
 
 /** Must match penumbra dumb_backend DEFERRED_VISION_MARKER */
 const DEFERRED_VISION_MARKER = "__HUMANE_DEFERRED_VISION__";
+const conversations = new ConversationRegistry<ACPSession>();
 
 function errorResponse(c: Context, status: number, message: string, type: string) {
   const body: OpenAIError = { error: { message, type } };
@@ -92,39 +96,87 @@ export async function handleChatCompletions(c: Context, config: Config) {
       }]
     : [];
 
-  let session;
+  let conversationId: string | undefined;
+  let fingerprint: string | undefined;
+  let firstPrompt;
   try {
-    session = await createSession(acpClient, process.cwd(), mcpServers);
-    if (agentModel && agentModel !== "default") {
-      await session.setModel(agentModel).catch(() => {});
+    if (body.conversation_id != null && typeof body.conversation_id !== "string") {
+      throw new Error("conversation_id must be a string");
     }
+    conversationId = resolveConversationId(
+      c.req.header("X-Starlight-Conversation-ID"),
+      body.conversation_id,
+    );
+    fingerprint = instructionFingerprint(body.messages);
+    firstPrompt = buildACPPrompt(body.messages, true);
+  } catch (err) {
+    return errorResponse(c, 400, (err as Error).message, "invalid_request");
+  }
+
+  const conversationKey = config.sessions.persist && conversationId
+    ? createHash("sha256")
+      .update(token)
+      .update("\0")
+      .update(body.model)
+      .update("\0")
+      .update(conversationId)
+      .digest("hex")
+    : undefined;
+
+  let acquired;
+  try {
+    acquired = await conversations.acquire({
+      key: conversationKey,
+      fingerprint,
+      maxEntries: config.sessions.max_sessions,
+      idleTimeoutMs: config.sessions.idle_timeout * 1000,
+      create: async () => {
+        const created = await createSession(acpClient, process.cwd(), mcpServers);
+        if (agentModel && agentModel !== "default") {
+          await created.setModel(agentModel).catch(() => {});
+        }
+        return created;
+      },
+    });
   } catch (err) {
     return errorResponse(c, 500, `Failed to create ACP session: ${(err as Error).message}`, "backend_error");
   }
 
-  const lastUser = body.messages.findLast((m) => m.role === "user");
-  if (!lastUser || !lastUser.content) {
-    await session.dispose().catch(() => {});
-    return errorResponse(c, 400, "No user message found", "invalid_request");
-  }
-
+  const session = acquired.session;
   let prompt;
   try {
-    prompt = openAIContentToACP(lastUser.content);
+    prompt = acquired.reused ? buildACPPrompt(body.messages, false) : firstPrompt;
   } catch (err) {
-    await session.dispose().catch(() => {});
+    if (acquired.persistent) {
+      await conversations.invalidate(conversationKey, session);
+    } else {
+      await session.dispose().catch(() => {});
+    }
     return errorResponse(c, 400, (err as Error).message, "invalid_request");
   }
 
+  const disposeAfterRequest = !acquired.persistent && config.mcp.cleanup_after_request;
+
   if (body.stream) {
     markBusy(acpClient.model_prefix);
-    return streamACPToOpenAI(c, session, prompt, body.model, config, acpClient.model_prefix);
+    return streamACPToOpenAI(
+      c,
+      session,
+      prompt,
+      body.model,
+      config,
+      acpClient.model_prefix,
+      disposeAfterRequest,
+      acquired.persistent
+        ? () => conversations.invalidate(conversationKey, session)
+        : undefined,
+    );
   }
 
   markBusy(acpClient.model_prefix);
   try {
     let responseText = await session.prompt(prompt);
-    if (config.mcp.cleanup_after_request) {
+    if (disposeAfterRequest) {
       await session.dispose().catch(() => {});
     }
 
@@ -148,7 +200,11 @@ export async function handleChatCompletions(c: Context, config: Config) {
     };
     return c.json(response);
   } catch (err) {
-    await session.dispose().catch(() => {});
+    if (acquired.persistent) {
+      await conversations.invalidate(conversationKey, session);
+    } else {
+      await session.dispose().catch(() => {});
+    }
     return errorResponse(c, 500, `ACP agent error: ${(err as Error).message}`, "backend_error");
   } finally {
     markIdle(acpClient.model_prefix);

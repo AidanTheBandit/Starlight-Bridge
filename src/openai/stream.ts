@@ -17,6 +17,8 @@ export async function streamACPToOpenAI(
   model: string,
   config: Config,
   modelPrefix?: string,
+  disposeAfterRequest: boolean = config.mcp.cleanup_after_request,
+  onSessionError?: () => void | Promise<void>,
 ): Promise<Response> {
   const id = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -68,6 +70,13 @@ export async function streamACPToOpenAI(
       await s.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
       await s.write("data: [DONE]\n\n");
     } catch (err) {
+      if (onSessionError) {
+        try {
+          await onSessionError();
+        } catch {
+          // Preserve the original streaming error.
+        }
+      }
       const errorChunk = {
         error: {
           message: (err as Error).message,
@@ -77,7 +86,7 @@ export async function streamACPToOpenAI(
       await s.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
       await s.write("data: [DONE]\n\n");
     } finally {
-      if (config.mcp.cleanup_after_request) {
+      if (disposeAfterRequest) {
         await session.dispose().catch(() => {});
       }
       if (modelPrefix) {

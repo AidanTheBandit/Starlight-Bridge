@@ -72,6 +72,32 @@ Client ──POST /v1/chat/completions──▶ Starlight Bridge ──ACP JSON-
 
 The agent gets client tools + its own native tools. The client gets a standard OpenAI API.
 
+### Conversation continuity and instructions
+
+OpenAI Chat Completions has no standard conversation identifier. To reuse one
+ACP session across turns, clients must supply an explicit Starlight extension:
+
+- `X-Starlight-Conversation-ID: <id>` header (preferred), or
+- `conversation_id: "<id>"` in the JSON request body.
+
+The scope also includes the API token and model, so different clients cannot
+share state by choosing the same ID. Requests without an ID are intentionally
+isolated in fresh sessions. Correlated sessions are bounded by
+`sessions.max_sessions` and `sessions.idle_timeout`.
+
+Ordered OpenAI `system` and `developer` messages are forwarded on the first
+turn of a correlated ACP session. ACP v1 has no native system-message field, so
+Starlight sends them in a delimited client-instruction envelope before the user
+content. Changing those instructions rotates the correlated ACP session.
+
+```bash
+curl http://localhost:7878/v1/chat/completions \
+  -H "Authorization: Bearer <your-token>" \
+  -H "Content-Type: application/json" \
+  -H "X-Starlight-Conversation-ID: example-chat" \
+  -d '{"model":"hermes-default","messages":[{"role":"system","content":"Answer briefly."},{"role":"user","content":"Remember that my code is blue."}]}'
+```
+
 ## Architecture
 
 ```
@@ -209,7 +235,7 @@ Set `STARLIGHT_CONFIG` env var to point at a custom config path.
 | `sessions.idle_timeout` | number | `300` | Close idle sessions after N seconds |
 | `sessions.max_sessions` | number | `10` | Maximum concurrent sessions |
 | `mcp.server_name` | string | `starlight-bridge` | MCP server identity |
-| `mcp.cleanup_after_request` | boolean | `true` | Deregister tools after response |
+| `mcp.cleanup_after_request` | boolean | `true` | Dispose uncorrelated sessions after response |
 
 ## API Endpoints
 
