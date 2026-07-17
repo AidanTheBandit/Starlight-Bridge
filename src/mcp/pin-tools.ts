@@ -180,61 +180,150 @@ async function reverseGeocodeHandler(args: Record<string, unknown>): Promise<unk
   };
 }
 
-/** Overpass nearby places search. */
+/** Overpass nearby places search with multi-mirror fallback. */
 async function nearbySearchHandler(args: Record<string, unknown>): Promise<unknown> {
   const latitude = num(args.latitude, "latitude");
   const longitude = num(args.longitude, "longitude");
   const radius = Math.min(Math.max(Number(args.radius_meters ?? 1000) || 1000, 50), 5000);
-  const query = str(args.query, "").trim();
+  const rawQuery = str(args.query, "").trim();
 
-  const nameFilter = query
-    ? `["name"~"${query.replace(/"/g, "")}",i]`
-    : "";
-  const overpass =
-    `[out:json][timeout:15];(` +
-    `node["amenity"]${nameFilter}(around:${radius},${latitude},${longitude});` +
-    `node["shop"]${nameFilter}(around:${radius},${latitude},${longitude});` +
-    `node["tourism"]${nameFilter}(around:${radius},${latitude},${longitude});` +
-    `);out body 10;`;
-
-  const resp = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: `data=${encodeURIComponent(overpass)}`,
-  });
-  if (!resp.ok) {
-    throw new Error(`Overpass HTTP ${resp.status}`);
-  }
-  const data = (await resp.json()) as {
-    elements?: Array<{
-      lat?: number;
-      lon?: number;
-      tags?: Record<string, string>;
-    }>;
+  // Map common category words to OSM tag filters so "coffee" finds amenity=cafe,
+  // "gas" finds amenity=fuel, etc. Falls back to a name regex for unmapped queries.
+  const CATEGORY_MAP: Record<string, string[]> = {
+    coffee: ['["amenity"="cafe"]', '["shop"="coffee"]'],
+    cafe: ['["amenity"="cafe"]'],
+    restaurant: ['["amenity"="restaurant"]', '["amenity"="fast_food"]'],
+    food: ['["amenity"="restaurant"]', '["amenity"="fast_food"]', '["amenity"="cafe"]', '["shop"="bakery"]'],
+    bar: ['["amenity"="bar"]', '["amenity"="pub"]'],
+    pub: ['["amenity"="pub"]'],
+    gas: ['["amenity"="fuel"]'],
+    fuel: ['["amenity"="fuel"]'],
+    gas_station: ['["amenity"="fuel"]'],
+    pharmacy: ['["amenity"="pharmacy"]', '["healthcare"="pharmacy"]'],
+    store: ['["shop"]'],
+    shop: ['["shop"]'],
+    shopping: ['["shop"]', '["shop"="mall"]'],
+    grocery: ['["shop"="supermarket"]', '["shop"="convenience"]'],
+    supermarket: ['["shop"="supermarket"]'],
+    hotel: ['["tourism"="hotel"]'],
+    atm: ['["amenity"="atm"]', '["amenity"="bank"]'],
+    bank: ['["amenity"="bank"]'],
+    hospital: ['["amenity"="hospital"]', '["amenity"="clinic"]'],
+    doctor: ['["amenity"="doctors"]', '["amenity"="clinic"]'],
+    park: ['["leisure"="park"]', '["leisure"="garden"]'],
+    school: ['["amenity"="school"]'],
+    gym: ['["leisure"="fitness_centre"]', '["sport"="fitness"]'],
+    fitness: ['["leisure"="fitness_centre"]'],
+    pizza: ['["amenity"="restaurant"]["cuisine"~"pizza",i]', '["amenity"="fast_food"]["cuisine"~"pizza",i]'],
+    mexican: ['["amenity"["cuisine"~"mexican",i]'],
+    chinese: ['["amenity"["cuisine"~"chinese",i]'],
+    sushi: ['["amenity"["cuisine"~"sushi|japanese",i]'],
+    charging: ['["amenity"="charging_station"]'],
+    ev: ['["amenity"="charging_station"]'],
+    parking: ['["amenity"="parking"]'],
+    toilet: ['["amenity"="toilets"]'],
+    bathroom: ['["amenity"="toilets"]'],
   };
+
+  const queryLower = rawQuery.toLowerCase().replace(/\s+/g, "_");
+  const categoryFilters = CATEGORY_MAP[queryLower];
+  const nameFilter = rawQuery
+    ? `["name"~"${rawQuery.replace(/"/g, "")}",i]`
+    : "";
+
+  let filters: string;
+  if (categoryFilters) {
+    // Use specific OSM tag filters for known categories
+    filters = categoryFilters.map(f => `node${f}(around:${radius},${latitude},${longitude});`).join("");
+  } else {
+    // General search: amenities/shops/tourism with optional name filter
+    filters =
+      `node["amenity"]${nameFilter}(around:${radius},${latitude},${longitude});` +
+      `node["shop"]${nameFilter}(around:${radius},${latitude},${longitude});` +
+      `node["tourism"]${nameFilter}(around:${radius},${latitude},${longitude});`;
+  }
+
+  const overpass = `[out:json][timeout:15];(${filters});out body 10;`;
+
+  // The main overpass-api.de is frequently overloaded. Try mirrors in order.
+  const mirrors = [
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+  ];
+
+  type OverpassData = { elements?: Array<{ lat?: number; lon?: number; tags?: Record<string, string> }> };
+  let data: OverpassData | null = null;
+  let lastError = "";
+
+  for (const mirror of mirrors) {
+    try {
+      const resp = await fetch(mirror, {
+        method: "POST",
+        signal: AbortSignal.timeout(12000),
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: `data=${encodeURIComponent(overpass)}`,
+      });
+      if (!resp.ok) {
+        lastError = `HTTP ${resp.status} from ${mirror}`;
+        continue;
+      }
+      data = (await resp.json()) as OverpassData;
+      break;
+    } catch (err) {
+      lastError = `${mirror}: ${(err as Error).message}`;
+      continue;
+    }
+  }
+
+  if (!data) {
+    return {
+      places: [],
+      query: rawQuery || null,
+      radius_meters: radius,
+      latitude,
+      longitude,
+      error: `All Overpass mirrors failed. Last error: ${lastError}`,
+    };
+  }
 
   const places = (data.elements ?? [])
     .filter((e) => e.lat != null && e.lon != null)
-    .slice(0, 8)
+    .slice(0, 10)
     .map((e) => {
       const tags = e.tags ?? {};
       const streetParts = [tags["addr:housenumber"], tags["addr:street"]].filter(Boolean);
       const address =
         tags["addr:full"] ?? (streetParts.length > 0 ? streetParts.join(" ") : null);
+      // Distance from the search center (haversine, approximate)
+      const distM = haversineMeters(latitude, longitude, e.lat!, e.lon!);
       return {
         name: tags.name ?? tags.amenity ?? tags.shop ?? tags.tourism ?? "Unknown",
         description: tags.amenity ?? tags.shop ?? tags.tourism ?? null,
         address,
         latitude: e.lat,
         longitude: e.lon,
+        distance_meters: Math.round(distM),
         website_url: tags.website ?? tags.url ?? null,
       };
-    });
+    })
+    .sort((a, b) => (a.distance_meters ?? 0) - (b.distance_meters ?? 0));
 
-  return { places, query: query || null, radius_meters: radius, latitude, longitude };
+  return { places, query: rawQuery || null, radius_meters: radius, latitude, longitude };
+}
+
+/** Approximate distance in meters between two lat/lon points. */
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 // ─── Pin photo tools ────────────────────────────────────────────────
@@ -411,6 +500,133 @@ async function waitForPinCameraHandler(args: Record<string, unknown>): Promise<u
   return data;
 }
 
+// ─── Device status / connectivity / unit conversion ────────────────
+
+/** GET /api/device — battery, thermal, OS/server versions. */
+async function pinDeviceStatusHandler(): Promise<unknown> {
+  const data = await fetchJson(`${pinBaseUrl}/api/device`);
+  return data;
+}
+
+/** GET /api/cellular/service-status — signal, operator, data state. */
+async function pinCellularStatusHandler(): Promise<unknown> {
+  const data = await fetchJson(`${pinBaseUrl}/api/cellular/service-status`);
+  return data;
+}
+
+/** PUT /api/wifi/set-enabled — toggle WiFi on/off. */
+async function pinToggleWifiHandler(args: Record<string, unknown>): Promise<unknown> {
+  const enabled = Boolean(args.enabled);
+  const resp = await fetch(`${pinBaseUrl}/api/wifi/set-enabled`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+    body: JSON.stringify({ enabled }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await resp.text();
+  let body: unknown = text;
+  try { body = JSON.parse(text); } catch { /* keep raw text */ }
+  return { ok: resp.ok, status: resp.status, enabled, result: body };
+}
+
+/** PUT /api/cellular/set-enabled — toggle cellular data on/off. */
+async function pinToggleCellularHandler(args: Record<string, unknown>): Promise<unknown> {
+  const enabled = Boolean(args.enabled);
+  const resp = await fetch(`${pinBaseUrl}/api/cellular/set-enabled`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+    body: JSON.stringify({ enabled }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await resp.text();
+  let body: unknown = text;
+  try { body = JSON.parse(text); } catch { /* keep raw text */ }
+  return { ok: resp.ok, status: resp.status, enabled, result: body };
+}
+
+/** Unit conversion and basic math via a lightweight local evaluator. */
+async function unitConvertHandler(args: Record<string, unknown>): Promise<unknown> {
+  const expr = str(args.expression).trim();
+  if (!expr) throw new Error("expression is required");
+
+  // Temperature conversions
+  const tempMatch = expr.match(/^(-?\d+(?:\.\d+)?)\s*(c|celsius|f|fahrenheit|k|kelvin)\s*(?:to|in|->?)\s*(c|celsius|f|fahrenheit|k|kelvin)$/i);
+  if (tempMatch) {
+    const val = parseFloat(tempMatch[1]);
+    const from = tempMatch[2].toLowerCase()[0];
+    const to = tempMatch[3].toLowerCase()[0];
+    let celsius: number;
+    if (from === "f") celsius = (val - 32) * 5 / 9;
+    else if (from === "k") celsius = val - 273.15;
+    else celsius = val;
+    let result: number;
+    if (to === "f") result = celsius * 9 / 5 + 32;
+    else if (to === "k") result = celsius + 273.15;
+    else result = celsius;
+    const unitName = { c: "C", f: "F", k: "K" }[to] ?? "";
+    return { expression: expr, result: Math.round(result * 100) / 100, unit: unitName };
+  }
+
+  // General unit conversion via a conversion table
+  const convMatch = expr.match(/^(-?\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*(?:to|in|->?)\s*([a-zA-Z]+)$/i);
+  if (convMatch) {
+    const val = parseFloat(convMatch[1]);
+    const from = convMatch[2].toLowerCase();
+    const to = convMatch[3].toLowerCase();
+    const result = convertUnits(val, from, to);
+    if (result !== null) return { expression: expr, result: Math.round(result * 10000) / 10000, from, to };
+    return { expression: expr, error: `Cannot convert ${from} to ${to}` };
+  }
+
+  // Basic arithmetic
+  const mathMatch = expr.match(/^[\d\s+\-*/().]+$/);
+  if (mathMatch) {
+    try {
+      const result = Function(`"use strict"; return (${expr})`)();
+      if (typeof result === "number" && Number.isFinite(result)) {
+        return { expression: expr, result };
+      }
+    } catch { /* fall through */ }
+  }
+
+  return { expression: expr, error: "Could not parse expression. Try '72F to C', '100 meters to feet', or '2 + 3 * 4'." };
+}
+
+const UNIT_TABLE: Record<string, { category: string; factor: number }> = {
+  // length (base: meters)
+  m: { category: "length", factor: 1 }, meter: { category: "length", factor: 1 }, meters: { category: "length", factor: 1 },
+  cm: { category: "length", factor: 0.01 },
+  km: { category: "length", factor: 1000 },
+  mm: { category: "length", factor: 0.001 },
+  ft: { category: "length", factor: 0.3048 }, feet: { category: "length", factor: 0.3048 }, foot: { category: "length", factor: 0.3048 },
+  in: { category: "length", factor: 0.0254 }, inch: { category: "length", factor: 0.0254 }, inches: { category: "length", factor: 0.0254 },
+  mi: { category: "length", factor: 1609.344 }, mile: { category: "length", factor: 1609.344 }, miles: { category: "length", factor: 1609.344 },
+  yd: { category: "length", factor: 0.9144 }, yard: { category: "length", factor: 0.9144 }, yards: { category: "length", factor: 0.9144 },
+  // weight (base: grams)
+  g: { category: "weight", factor: 1 }, gram: { category: "weight", factor: 1 }, grams: { category: "weight", factor: 1 },
+  kg: { category: "weight", factor: 1000 },
+  mg: { category: "weight", factor: 0.001 },
+  lb: { category: "weight", factor: 453.592 }, lbs: { category: "weight", factor: 453.592 }, pound: { category: "weight", factor: 453.592 }, pounds: { category: "weight", factor: 453.592 },
+  oz: { category: "weight", factor: 28.3495 }, ounce: { category: "weight", factor: 28.3495 }, ounces: { category: "weight", factor: 28.3495 },
+  // volume (base: liters)
+  l: { category: "volume", factor: 1 }, liter: { category: "volume", factor: 1 }, liters: { category: "volume", factor: 1 },
+  ml: { category: "volume", factor: 0.001 },
+  gal: { category: "volume", factor: 3.78541 }, gallon: { category: "volume", factor: 3.78541 }, gallons: { category: "volume", factor: 3.78541 },
+  cup: { category: "volume", factor: 0.236588 }, cups: { category: "volume", factor: 0.236588 },
+  // speed (base: m/s)
+  mps: { category: "speed", factor: 1 },
+  mph: { category: "speed", factor: 0.44704 },
+  kph: { category: "speed", factor: 0.277778 }, kmh: { category: "speed", factor: 0.277778 },
+};
+
+function convertUnits(val: number, from: string, to: string): number | null {
+  const f = UNIT_TABLE[from];
+  const t = UNIT_TABLE[to];
+  if (!f || !t || f.category !== t.category) return null;
+  const baseVal = val * f.factor;
+  return baseVal / t.factor;
+}
+
 
 /** Build the pin tool set for MCP registration. */
 export function buildPinTools(): RegisteredTool[] {
@@ -559,6 +775,76 @@ export function buildPinTools(): RegisteredTool[] {
         required: [],
       },
       handler: waitForPinCameraHandler,
+    },
+    {
+      name: "pin_device_status",
+      description:
+        "Get the pin's device status including battery level, thermal state, OS version, display name, server version, and installed component versions. Use for 'what's my battery' or general device info.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+      handler: pinDeviceStatusHandler,
+    },
+    {
+      name: "pin_cellular_status",
+      description:
+        "Check cellular service status on the pin: signal strength, operator, data connection state, and whether cellular is usable.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        required: [],
+      },
+      handler: pinCellularStatusHandler,
+    },
+    {
+      name: "pin_toggle_wifi",
+      description:
+        "Enable or disable WiFi on the pin. Use when the user asks to turn wifi on or off.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            description: "true to enable WiFi, false to disable.",
+          },
+        },
+        required: ["enabled"],
+      },
+      handler: pinToggleWifiHandler,
+    },
+    {
+      name: "pin_toggle_cellular",
+      description:
+        "Enable or disable cellular data on the pin. Use when the user asks to turn cellular/mobile data on or off.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            description: "true to enable cellular, false to disable.",
+          },
+        },
+        required: ["enabled"],
+      },
+      handler: pinToggleCellularHandler,
+    },
+    {
+      name: "unit_convert",
+      description:
+        "Convert between units or perform quick math. Handles temperature, length, weight, volume, speed, and time conversions, plus basic arithmetic. Use for 'how many feet in 100 meters' or 'convert 72 f to c'.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          expression: {
+            type: "string",
+            description: "The conversion or math expression, e.g. '72F to C', '100 meters to feet', '2 + 3 * 4'.",
+          },
+        },
+        required: ["expression"],
+      },
+      handler: unitConvertHandler,
     },
   ];
 }
