@@ -64,8 +64,8 @@ export function shouldEscalateToAgent(text: string): string | null {
     // Simple generic tool requests may be handled by rapid when those tools are available.
     [/\b(nearby|directions|navigate|maps?)\b/, "live_location_data"],
     [/\b(wifi|cellular|battery|device status|toggle (wifi|cellular))\b/, "device_control"],
-    // Camera capture/vision needs ACP to receive and reason over the resulting image.
-    [/\b(camera|photo|picture|look at|what do you see|see in front|scan|barcode)\b/, "vision_or_camera"],
+    // Capturing a photo is a simple tool action; interpreting it belongs to ACP.
+    [/\b(what do you see|look at|describe (what|this)|analy[sz]e|scan|barcode)\b/, "vision_analysis"],
     // Coding / technical
     [/\b(code|coding|debug|debugger|stacktrace|stack trace|exception|segfault|compile|compiler)\b/, "coding"],
     [/\b(typescript|javascript|python|rust|kotlin|java|golang|c\+\+|sql|regex)\b/, "programming_language"],
