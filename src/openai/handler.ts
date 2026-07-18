@@ -10,12 +10,14 @@ import {
   clearScopedTools,
   setScopedTools,
   toolRegistry,
+  getToolsForScope,
   type RegisteredTool,
 } from "../mcp/store.js";
 import type { OpenAIRequest, OpenAIResponse, OpenAIError, OpenAITool } from "./types.js";
 import { streamACPToOpenAI } from "./stream.js";
 import { passthrough } from "./passthrough.js";
 import { rapidAnswerResponse, tryRapid } from "./rapid.js";
+import { maybeStripMarkdown } from "./plaintext.js";
 import { buildACPPrompt, instructionFingerprint, resolveConversationId } from "./messages.js";
 
 const DEFERRED_VISION_MARKER = "__HUMANE_DEFERRED_VISION__";
@@ -90,14 +92,24 @@ export async function handleChatCompletions(c: Context, config: Config) {
 
   if (config.passthrough.enabled) return passthrough(c, config);
 
+  // Rapid may directly execute configured, generic MCP tools for simple requests.
+  // Client-supplied tools still belong to ACP because they are request-scoped.
+  const rapidRegisteredTools = Array.from(getToolsForScope().values());
+  const executeRapidTool = async (name: string, args: Record<string, unknown>) => {
+    const tool = rapidRegisteredTools.find((candidate) => candidate.name === name);
+    if (!tool?.handler) throw new Error(`Tool "${name}" is unavailable`);
+    return tool.handler(args);
+  };
+
   // Rapid path: fast OpenAI-compatible model answers simple prompts immediately.
   // On escalate/skip/error we fall through to the normal ACP agent path.
   // Streaming requests always use ACP so tool/agent turns remain stream-compatible.
   if (config.rapid?.enabled && !body.stream) {
-    const rapid = await tryRapid(body, config);
+    const rapid = await tryRapid(body, config, fetch, rapidRegisteredTools, executeRapidTool);
     if (rapid.kind === "answer") {
       console.log(`[rapid] answered model=${rapid.model}`);
-      return c.json(rapidAnswerResponse(body.model, rapid.content, rapid.model));
+      const content = maybeStripMarkdown(rapid.content, config.response?.strip_markdown);
+      return c.json(rapidAnswerResponse(body.model, content, rapid.model));
     }
     if (rapid.kind === "escalate") {
       console.log(`[rapid] escalate → acp reason=${rapid.reason}`);
@@ -219,6 +231,7 @@ export async function handleChatCompletions(c: Context, config: Config) {
   try {
     let responseText = await session.prompt(prompt);
     if (responseText.includes(DEFERRED_VISION_MARKER)) responseText = DEFERRED_VISION_MARKER;
+    else responseText = maybeStripMarkdown(responseText, config.response?.strip_markdown);
 
     const response: OpenAIResponse = {
       id: `chatcmpl-${Date.now()}`,

@@ -64,7 +64,21 @@ const PassthroughSchema = z.object({
  * The rapid model only gets an escalate_to_agent tool. If it escalates (or fails),
  * Starlight falls through to the normal ACP path. Disabled by default so generic
  * installs stay ACP-only.
+ *
+ * Intended scope: general Q&A, casual chat, weather, and vision only.
+ * Live status, tools, device control, coding, and multi-step work escalate to ACP.
+ * Keep this prompt product-neutral — no hostnames, devices, or vendor facts.
  */
+const DEFAULT_RAPID_SYSTEM_PROMPT = [
+  "You are RAPID, the optional fast path in front of a full agent.",
+  "Your job is general Q&A, casual conversation, simple explanations, weather, quick math/unit conversion, vision when an image is already provided, and simple calls to the supplied generic tools.",
+  "",
+  "You are not the full agent. You cannot code, browse freely, execute shell commands, manage files, or perform multi-step technical work.",
+  "Use a supplied tool for camera capture or vision requests. When the camera tool returns the deferred vision marker, return that marker exactly and do not hand off to Hermes.",
+  "Escalate to Hermes only for live or private server status, coding, infrastructure, configuration, multi-step work, unsupported tools, or uncertainty.",
+  "Prefer escalate_to_agent over guessing. Keep answers short and plain when you do answer.",
+].join(" ");
+
 const RapidSchema = z.object({
   enabled: z.boolean().default(false),
   /** OpenAI-compatible chat completions base URL (no trailing /v1/chat/completions). */
@@ -78,14 +92,16 @@ const RapidSchema = z.object({
   /** Request timeout in ms for the rapid call. */
   timeout_ms: z.number().default(12_000),
   /**
-   * Extra system instruction describing rapid-mode limits.
-   * Keep product-specific wording out of core defaults.
+   * System instruction that teaches the rapid model its limits.
+   * Override in config for voice/tone; keep product facts out of the bridge.
    */
-  system_prompt: z.string().default(
-    "You are the fast path. Answer only simple, self-contained questions you can solve immediately without tools, device access, browsing, code execution, or multi-step planning. " +
-    "If the user needs tools, current facts you do not know, device control, multi-step work, or you are unsure, call escalate_to_agent with a short reason. " +
-    "Do not invent tool results. Prefer escalate_to_agent over guessing.",
-  ),
+  system_prompt: z.string().default(DEFAULT_RAPID_SYSTEM_PROMPT),
+});
+
+/** Response shaping for clients that cannot render markdown (e.g. wearables). */
+const ResponseSchema = z.object({
+  /** Strip common markdown markers from assistant text when true. Default false. */
+  strip_markdown: z.boolean().default(false),
 });
 
 const ConfigSchema = z.object({
@@ -113,11 +129,9 @@ const ConfigSchema = z.object({
     model: "gemini-3-flash-preview",
     escalate_tool: "escalate_to_agent",
     timeout_ms: 12_000,
-    system_prompt:
-      "You are the fast path. Answer only simple, self-contained questions you can solve immediately without tools, device access, browsing, code execution, or multi-step planning. " +
-      "If the user needs tools, current facts you do not know, device control, multi-step work, or you are unsure, call escalate_to_agent with a short reason. " +
-      "Do not invent tool results. Prefer escalate_to_agent over guessing.",
+    system_prompt: DEFAULT_RAPID_SYSTEM_PROMPT,
   }),
+  response: ResponseSchema.default({ strip_markdown: false }),
 }).transform((config) => {
   // Pre-sort acp_clients by longest prefix first (for longest-match routing)
   config.acp_clients.sort((a, b) => b.model_prefix.length - a.model_prefix.length);

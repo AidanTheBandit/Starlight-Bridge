@@ -4,6 +4,7 @@ import type { ACPSession, ACPPromptContent } from "../acp/session.js";
 import type { Config } from "../config.js";
 import type { OpenAIStreamChunk } from "./types.js";
 import { markIdle } from "../acp/manager.js";
+import { maybeStripMarkdown } from "./plaintext.js";
 
 class SSEWriteError extends Error {
   constructor(cause: unknown) {
@@ -17,6 +18,9 @@ class SSEWriteError extends Error {
  * Stream an ACP session response as OpenAI-compatible SSE.
  * Caller must call markBusy(prefix) before invoking this.
  * This function calls markIdle(prefix) when the stream completes.
+ *
+ * When strip_markdown is enabled we buffer the full ACP response and emit a
+ * single cleaned content chunk (streaming markdown strip is lossy mid-token).
  */
 export async function streamACPToOpenAI(
   c: Context,
@@ -31,6 +35,7 @@ export async function streamACPToOpenAI(
 ): Promise<Response> {
   const id = `chatcmpl-${Date.now()}`;
   const created = Math.floor(Date.now() / 1000);
+  const strip = Boolean(config.response?.strip_markdown);
 
   return stream(c, async (s) => {
     const write = async (data: string): Promise<void> => {
@@ -56,20 +61,42 @@ export async function streamACPToOpenAI(
       await write(`data: ${JSON.stringify(roleChunk)}\n\n`);
 
       try {
-        await session.prompt(prompt, async (chunk: string) => {
-          const contentChunk: OpenAIStreamChunk = {
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [{
-              index: 0,
-              delta: { content: chunk },
-              finish_reason: null,
-            }],
-          };
-          await write(`data: ${JSON.stringify(contentChunk)}\n\n`);
-        });
+        if (strip) {
+          let full = "";
+          await session.prompt(prompt, async (chunk: string) => {
+            full += chunk;
+          });
+          const cleaned = maybeStripMarkdown(full, true);
+          if (cleaned) {
+            const contentChunk: OpenAIStreamChunk = {
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [{
+                index: 0,
+                delta: { content: cleaned },
+                finish_reason: null,
+              }],
+            };
+            await write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+          }
+        } else {
+          await session.prompt(prompt, async (chunk: string) => {
+            const contentChunk: OpenAIStreamChunk = {
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [{
+                index: 0,
+                delta: { content: chunk },
+                finish_reason: null,
+              }],
+            };
+            await write(`data: ${JSON.stringify(contentChunk)}\n\n`);
+          });
+        }
       } catch (err) {
         // A downstream SSE failure is local to this response. Only an actual
         // ACP prompt failure makes the retained session unsafe to reuse.

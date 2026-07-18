@@ -84,6 +84,10 @@ const config: Config = {
     timeout_ms: 12000,
     system_prompt: "fast path",
   },
+  response: {
+    strip_markdown: false,
+  },
+
 
 };
 

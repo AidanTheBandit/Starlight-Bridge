@@ -52,3 +52,20 @@ mcp:
 #   model: "gemini-3-flash-preview"
 #   escalate_tool: "escalate_to_agent"
 #   timeout_ms: 12000
+
+# Optional rapid mode: answer simple prompts with a fast OpenAI-compatible model.
+# The rapid model gets its own system_prompt teaching it to escalate anything beyond
+# general Q&A / weather / vision. No product hostnames belong here.
+# rapid:
+#   enabled: true
+#   base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+#   api_key: ""   # or STARLIGHT_RAPID_API_KEY
+#   model: "gemini-3-flash-preview"
+#   escalate_tool: "escalate_to_agent"
+#   timeout_ms: 12000
+#   system_prompt: "You are RAPID..."
+
+# Optional response shaping for clients that cannot render markdown (TTS/wearables)
+# response:
+#   strip_markdown: true
+

@@ -1,10 +1,13 @@
 import type { Config } from "../config.js";
-import type { OpenAIMessage, OpenAIRequest, OpenAIResponse } from "./types.js";
+import type { RegisteredTool } from "../mcp/store.js";
+import type { OpenAIMessage, OpenAIRequest, OpenAIResponse, OpenAITool } from "./types.js";
 
 export type RapidDecision =
   | { kind: "answer"; content: string; model: string }
   | { kind: "escalate"; reason: string }
   | { kind: "skip"; reason: string };
+
+type RapidToolExecutor = (name: string, args: Record<string, unknown>) => Promise<unknown>;
 
 interface RapidUpstreamChoice {
   message?: {
@@ -49,6 +52,69 @@ function hasNonTextUserContent(messages: OpenAIRequest["messages"]): boolean {
   });
 }
 
+/** Heuristic: technical / toolful / live-status prompts skip rapid and go to ACP. */
+export function shouldEscalateToAgent(text: string): string | null {
+  const t = text.toLowerCase();
+  if (!t.trim()) return null;
+
+  // Product-neutral only. No hostnames, nicknames, or vendor facts.
+  const patterns: Array<[RegExp, string]> = [
+    // Live status the fast model cannot know
+    [/\b(how many (people|players|users)|player count|online (now|right now)|server status|is (the )?server (up|down|online)|who('s| is) (on|online))\b/, "live_status"],
+    // Simple generic tool requests may be handled by rapid when those tools are available.
+    [/\b(nearby|directions|navigate|maps?)\b/, "live_location_data"],
+    [/\b(wifi|cellular|battery|device status|toggle (wifi|cellular))\b/, "device_control"],
+    // Coding / technical
+    [/\b(code|coding|debug|debugger|stacktrace|stack trace|exception|segfault|compile|compiler)\b/, "coding"],
+    [/\b(typescript|javascript|python|rust|kotlin|java|golang|c\+\+|sql|regex)\b/, "programming_language"],
+    [/\b(function|class |import |export |const |let |var |async |await |promise|api endpoint)\b/, "code_syntax"],
+    [/\b(git|github|pull request|merge conflict|dockerfile|kubernetes|k8s|helm|terraform)\b/, "devops"],
+    // Servers / infra
+    [/\b(servers?|vps|hosting|datacenter|data center|rack|uptime|latency|bandwidth)\b/, "servers"],
+    [/\b(ssh|deploy|deployment|systemd|nginx|apache|caddy|docker|container|ci\/cd|firewall|iptables|selinux)\b/, "infra"],
+    [/\b(reverse engineer|decompile|frida|protobuf|grpc|json-rpc|mcp|acp)\b/, "systems_engineering"],
+    [/\b(config|configuration|yaml|toml|json schema|env var|environment variable)\b/, "config_work"],
+    [/\b(implement|refactor|patch|fix the bug|write a script|unit test|integration test)\b/, "engineering_task"],
+    // Multi-step / research
+    [/\b(browse|search the web|look up|research|scrape|crawl)\b/, "browsing"],
+    [/\b(step by step|multi-?step|plan out|architecture|design a system)\b/, "multi_step"],
+  ];
+
+  for (const [re, reason] of patterns) {
+    if (re.test(t)) return reason;
+  }
+  return null;
+}
+
+function rapidTools(tools: RegisteredTool[], escalateTool: string): OpenAITool[] {
+  const configured = tools
+    .filter((tool) => tool.handler)
+    .map((tool) => ({
+      type: "function" as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema,
+      },
+    }));
+  return [
+    ...configured,
+    {
+      type: "function" as const,
+      function: {
+        name: escalateTool,
+        description:
+          "Hand this request to Hermes/ACP. MUST call for coding, infrastructure, multi-step work, unsupported tools, camera image analysis, or uncertainty.",
+        parameters: {
+          type: "object",
+          properties: { reason: { type: "string", description: "Short reason." } },
+          required: ["reason"],
+        },
+      },
+    },
+  ];
+}
+
 function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "").replace(/\/v1\/chat\/completions$/i, "");
 }
@@ -62,7 +128,18 @@ function buildRapidMessages(body: OpenAIRequest, systemPrompt: string): OpenAIMe
       continue;
     }
     if (msg.role === "assistant" || msg.role === "user") {
-      // Rapid mode is text-only. Drop tool/function messages and non-text parts.
+      // Pass text; for user turns also pass image_url parts so rapid can do vision Q&A.
+      if (msg.role === "user" && Array.isArray(msg.content)) {
+        const parts = msg.content.filter(
+          (part) =>
+            (part.type === "text" && typeof part.text === "string") ||
+            part.type === "image_url",
+        );
+        if (parts.length > 0) {
+          out.push({ role: "user", content: parts as OpenAIMessage["content"] });
+          continue;
+        }
+      }
       const text = textFromContent(msg.content);
       if (text.trim()) out.push({ role: msg.role, content: text });
     }
@@ -80,6 +157,8 @@ export async function tryRapid(
   body: OpenAIRequest,
   config: Config,
   fetchImpl: typeof fetch = fetch,
+  tools: RegisteredTool[] = [],
+  executeTool?: RapidToolExecutor,
 ): Promise<RapidDecision> {
   const rapid = config.rapid;
   if (!rapid?.enabled) return { kind: "skip", reason: "disabled" };
@@ -90,95 +169,123 @@ export async function tryRapid(
   if (Array.isArray(body.tools) && body.tools.length > 0) {
     return { kind: "skip", reason: "client_tools_present" };
   }
-  if (hasNonTextUserContent(body.messages)) {
-    return { kind: "skip", reason: "non_text_content" };
+  // Multimodal content is allowed for vision Q&A (rapid model may answer from images).
+  // Non-text non-image parts still skip.
+  const hasUnsupportedParts = body.messages.some((msg) => {
+    if (msg.role !== "user" || typeof msg.content === "string" || msg.content == null) return false;
+    return msg.content.some((part) => part.type !== "text" && part.type !== "image_url");
+  });
+  if (hasUnsupportedParts) {
+    return { kind: "skip", reason: "unsupported_content" };
   }
-  if (!lastUserText(body.messages)) {
+  const userText = lastUserText(body.messages);
+  if (!userText && !hasNonTextUserContent(body.messages)) {
     return { kind: "skip", reason: "empty_user_message" };
+  }
+  // Deterministic escalate for technical / toolful requests before calling the fast model.
+  if (userText) {
+    const reason = shouldEscalateToAgent(userText);
+    const simpleToolReasons = new Set(["live_location_data", "device_control"]);
+    if (reason && !(simpleToolReasons.has(reason) && tools.some((tool) => tool.handler))) {
+      return { kind: "escalate", reason };
+    }
   }
 
   const escalateTool = rapid.escalate_tool || "escalate_to_agent";
   const base = normalizeBaseUrl(rapid.base_url);
   const url = `${base}/chat/completions`;
+  const rapidMessages = buildRapidMessages(body, rapid.system_prompt);
+  const availableTools = rapidTools(tools, escalateTool);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(1_000, rapid.timeout_ms));
 
   try {
-    const resp = await fetchImpl(url, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${rapid.api_key}`,
-      },
-      body: JSON.stringify({
-        model: rapid.model,
-        stream: false,
-        temperature: 0.2,
-        messages: buildRapidMessages(body, rapid.system_prompt),
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: escalateTool,
-              description:
-                "Hand this request to the full agent path. Call when tools, device access, current data, multi-step work, or uncertainty is required.",
-              parameters: {
-                type: "object",
-                properties: {
-                  reason: {
-                    type: "string",
-                    description: "Short reason the full agent is needed.",
-                  },
-                },
-                required: ["reason"],
-              },
-            },
-          },
-        ],
-        tool_choice: "auto",
-      }),
-    });
+    for (let turn = 0; turn < 2; turn++) {
+      const resp = await fetchImpl(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${rapid.api_key}`,
+        },
+        body: JSON.stringify({
+          model: rapid.model,
+          stream: false,
+          temperature: 0.2,
+          messages: rapidMessages,
+          tools: availableTools,
+          tool_choice: "auto",
+        }),
+      });
 
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => "");
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => "");
+        return {
+          kind: "escalate",
+          reason: `rapid upstream ${resp.status}${errText ? `: ${errText.slice(0, 200)}` : ""}`,
+        };
+      }
+
+      const data = (await resp.json()) as RapidUpstreamResponse;
+      const choice = data.choices?.[0];
+      const message = choice?.message;
+      if (!message) return { kind: "escalate", reason: "empty_rapid_response" };
+
+      const toolCalls = message.tool_calls ?? [];
+      const escalateCall = toolCalls.find((call) => call.function?.name === escalateTool);
+      if (escalateCall) {
+        let reason = "escalate_to_agent";
+        try {
+          const args = JSON.parse(escalateCall.function?.arguments || "{}") as { reason?: string };
+          if (args.reason?.trim()) reason = args.reason.trim();
+        } catch {
+          // keep default
+        }
+        return { kind: "escalate", reason };
+      }
+
+      if (toolCalls.length > 0) {
+        const call = toolCalls[0];
+        const name = call.function?.name ?? "";
+        const registered = tools.find((tool) => tool.name === name);
+        if (!executeTool || !registered) {
+          return { kind: "escalate", reason: `unavailable_tool:${name || "unknown"}` };
+        }
+        let args: Record<string, unknown>;
+        try {
+          args = JSON.parse(call.function?.arguments || "{}") as Record<string, unknown>;
+        } catch {
+          return { kind: "escalate", reason: `invalid_tool_args:${name}` };
+        }
+        let result: unknown;
+        try {
+          result = await executeTool(name, args);
+        } catch (err) {
+          result = { error: (err as Error).message };
+        }
+        rapidMessages.push({
+          role: "assistant",
+          content: typeof message.content === "string" ? message.content : null,
+          tool_calls: toolCalls as OpenAIMessage["tool_calls"],
+        });
+        rapidMessages.push({
+          role: "tool",
+          tool_call_id: call.id || `${name}-${turn}`,
+          content: typeof result === "string" ? result : JSON.stringify(result),
+        });
+        continue;
+      }
+
+      const content = typeof message.content === "string" ? message.content.trim() : "";
+      if (!content) return { kind: "escalate", reason: "empty_content" };
+
       return {
-        kind: "escalate",
-        reason: `rapid upstream ${resp.status}${errText ? `: ${errText.slice(0, 200)}` : ""}`,
+        kind: "answer",
+        content,
+        model: data.model || rapid.model,
       };
     }
-
-    const data = (await resp.json()) as RapidUpstreamResponse;
-    const choice = data.choices?.[0];
-    const message = choice?.message;
-    if (!message) return { kind: "escalate", reason: "empty_rapid_response" };
-
-    const toolCalls = message.tool_calls ?? [];
-    const escalateCall = toolCalls.find((call) => call.function?.name === escalateTool);
-    if (escalateCall) {
-      let reason = "escalate_to_agent";
-      try {
-        const args = JSON.parse(escalateCall.function?.arguments || "{}") as { reason?: string };
-        if (args.reason?.trim()) reason = args.reason.trim();
-      } catch {
-        // keep default
-      }
-      return { kind: "escalate", reason };
-    }
-
-    if (toolCalls.length > 0) {
-      // Any unexpected tool is treated as an ACP handoff.
-      return { kind: "escalate", reason: `unexpected_tool:${toolCalls[0]?.function?.name ?? "unknown"}` };
-    }
-
-    const content = typeof message.content === "string" ? message.content.trim() : "";
-    if (!content) return { kind: "escalate", reason: "empty_content" };
-
-    return {
-      kind: "answer",
-      content,
-      model: data.model || rapid.model,
-    };
+    return { kind: "escalate", reason: "rapid_tool_loop_limit" };
   } catch (err) {
     const msg = (err as Error).name === "AbortError"
       ? "rapid_timeout"
